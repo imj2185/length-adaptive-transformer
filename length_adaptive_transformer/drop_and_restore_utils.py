@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List
 
 import numpy as np
+import math
 
 
 def sample_length_configuration(
@@ -48,6 +49,80 @@ def sample_layer_configuration(
         return tuple(range(num_hidden_layers - np.random.randint(0, layer_dropout_bound + 1)))
     return None
 
+
+def sample_head_configuration(
+    num_heads,
+    num_hidden_layers,
+    layer_config=None,
+    max_head_pruning=False,
+    random_head_pruning=False,
+    min_head=1,
+):
+    max_pruning_configuration = [math.floor(r) for r in np.linspace(min_head, num_heads, num_hidden_layers)]
+    max_pruning_configuration[-1] -= 1
+    
+    head = 0
+    head_configuration = ()
+    for i in range(num_hidden_layers):
+        if layer_config is None or i in layer_config:
+            if max_head_pruning:
+                head = max_pruning_configuration[i]
+            elif random_head_pruning:
+                head = np.random.randint(head, max_pruning_configuration[i])
+        head_configuration += (head,)
+    return head_configuration
+
+def what_to_prune(
+    head_importance,
+    gene,
+    to_prune=None,
+    at_least_x_heads_per_layer=0,
+    rescale_by_number=False,
+):
+    head_importance = head_importance.clone()
+    n_layers, n_heads = head_importance.size()
+    to_prune = to_prune or {}
+    if rescale_by_number:
+        for layer in to_prune:
+            #head_importance[layer] *= sqrt(n_layers / len(to_prune[layer]))
+            head_importance[layer] *= math.sqrt(len(to_prune[layer]) / n_layers)
+    # Sort heads by score
+    heads_and_score = [
+        ((layer, head), head_importance[layer, head])
+        for layer in range(n_layers)
+        for head in range(n_heads)
+    ]
+    heads_and_score = sorted(heads_and_score, key=lambda x: x[1])
+    sorted_heads = [head_and_score[0]
+                    for head_and_score in heads_and_score]
+    # Ensure we don't delete all heads in a layer
+    if at_least_x_heads_per_layer:
+        # Remove the top scoring head in each layer
+        to_protect = {l: 0 for l in range(n_layers)}
+        filtered_sorted_heads = []
+        for layer, head in reversed(sorted_heads):
+            if layer in to_protect:
+                if to_protect[layer] < at_least_x_heads_per_layer:
+                    to_protect[layer] += 1
+                    continue
+                else:
+                    to_protect.pop(layer)
+            filtered_sorted_heads.insert(0, (layer, head))
+        sorted_heads = filtered_sorted_heads
+    # layer/heads that were already pruned
+    # Prune the lowest scoring heads
+    sorted_heads = [
+        (layer, head)
+        for (layer, head) in sorted_heads
+        if layer not in to_prune or head not in to_prune[layer]
+    ]
+    # Update heads to prune
+    for layer, head in sorted_heads:
+        if layer not in to_prune:
+            to_prune[layer] = []
+        if len(to_prune[layer]) < gene[layer]:
+            to_prune[layer].append(head)
+    return to_prune
 
 @dataclass
 class LengthDropArguments:
@@ -94,6 +169,7 @@ def add_drop_and_restore_args(parser):
 @dataclass
 class SearchArguments:
     do_search: Optional[bool] = field(default=False)
+    do_ray_search: Optional[bool] = field(default=False)
     load_store_file: Optional[str] = field(default=None)
     evo_iter: Optional[int] = field(default=100)
     population_size: Optional[int] = field(default=20)

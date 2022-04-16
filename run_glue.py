@@ -24,6 +24,7 @@
 import dataclasses
 import logging
 import os
+os.environ["CUDA_VISIBLE_DEVICES"]='1'
 import sys
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional
@@ -167,7 +168,7 @@ def main():
     )
     eval_dataset = (
         GlueDataset(data_args, tokenizer=tokenizer, mode="dev", cache_dir=model_args.cache_dir)
-        if training_args.do_eval
+        if training_args.do_eval or search_args.do_search
         else None
     )
     test_dataset = (
@@ -338,6 +339,19 @@ def main():
                     k += 1
 
     return eval_results
+
+    if search_args.do_ray_search:
+        import ray
+        @ray.remote
+        class EvoNetwork(object):
+            def __init__(self, 
+                tokenizer: PreTrainedTokenizer = None,
+                best_metric: str = 'acc',
+                length_drop_args: LengthDropArguments = None,
+                **kwargs,
+            ):
+                self.tokenizer = tokenizer
+
 
 
 def _mp_fn(index):

@@ -25,6 +25,8 @@ import argparse
 import glob
 import logging
 import os
+
+os.environ["CUDA_VISIBLE_DEVICES"]='0'
 import random
 import timeit
 from collections import defaultdict
@@ -58,8 +60,10 @@ from transformers.data.processors.squad import SquadResult, SquadV1Processor, Sq
 from length_adaptive_transformer.drop_and_restore_utils import (
     sample_length_configuration,
     sample_layer_configuration,
+    sample_head_configuration,
     add_drop_and_restore_args,
     add_search_args,
+    what_to_prune,
 )
 from length_adaptive_transformer.evolution import (
     Evolution, approx_ratio, inverse, store2str
@@ -160,6 +164,7 @@ def train(args, train_dataset, model, tokenizer):
 
         model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
 
+    model.set_fn_layer_parameters()
     # multi-gpu training (should be after apex fp16 initialization)
     if args.n_gpu > 1:
         model = torch.nn.DataParallel(model)
@@ -169,6 +174,9 @@ def train(args, train_dataset, model, tokenizer):
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True,
         )
+
+    #use funcitonal linear in multi head attention
+    # model.module.set_sample_parameters() if hasattr(model, "module") else model.set_sample_parameters()
 
     # Train!
     logger.info("***** Running training *****")
@@ -210,6 +218,17 @@ def train(args, train_dataset, model, tokenizer):
     # Added here for reproductibility
     set_seed(args)
 
+    model_type = model.module.config.model_type if hasattr(model, "module") else model.config.num_hidden_layers
+
+    if model_type == "distilbert":
+        bert = model.module.distilbert if hasattr(model, "module") else model.distilbert
+    elif model_type == "roberta":
+        bert = model.module.roberta if hasattr(model, "module") else model.roberta
+    elif model_type == "mobilebert":
+        bert = model.module.mobilebert if hasattr(model, "module") else model.mobilebert
+    else:
+        bert = model.module.bert if hasattr(model, "module") else model.bert
+
     for epoch in range(epochs_trained, int(args.num_train_epochs)):
         for step, batch in enumerate(train_dataloader):
             # Skip past any already trained steps if resuming training
@@ -226,6 +245,7 @@ def train(args, train_dataset, model, tokenizer):
                 "start_positions": batch[3],
                 "end_positions": batch[4],
             }
+            input_mask = batch[1]
 
             if args.model_type in ["xlm", "roberta", "distilbert", "camembert"]:
                 del inputs["token_type_ids"]
@@ -241,15 +261,21 @@ def train(args, train_dataset, model, tokenizer):
 
             inputs["output_attentions"] = args.length_config is not None
 
+            num_h_layers = bert.config.num_hidden_layers
+
             layer_config = sample_layer_configuration(
-                model.config.num_hidden_layers,
+                num_h_layers,
                 layer_dropout_prob=args.layer_dropout_prob,
                 layer_dropout=0,
             )
+
+            inputs["head_prune"] = True
+
             inputs["layer_config"] = layer_config
-
             inputs["length_config"] = args.length_config
+            
 
+            #with only layer drop
             outputs = model(**inputs)
             # model outputs are always tuple in transformers (see doc)
             task_loss = div_loss(outputs[0], args)
@@ -265,6 +291,21 @@ def train(args, train_dataset, model, tokenizer):
             else:
                 loss.backward()
 
+            head_importance = torch.zeros(bert.config.num_hidden_layers, bert.config.num_attention_heads).to(bert.device)
+
+            for layer in range(bert.config.num_hidden_layers):
+                if layer in layer_config:
+                    self_att = bert.transformer.layer[layer].attention if model_type == "distilbert" else bert.encoder.layer[layer].attention.self
+                    ctx = self_att.context_layer_val
+                    grad_ctx = ctx.grad
+                    # Take the dot
+                    dot = torch.einsum("bhli,bhli->bhl", [grad_ctx, ctx])
+                    head_importance[layer] += dot.abs().sum(-1).sum(0).detach()
+
+            tot_tokens = input_mask.float().detach().sum().data
+            # head_importance[:-1] /= tot_tokens
+            # head_importance[-1] /= tot_tokens
+            head_importance /= tot_tokens
             # inplace distillation
             if args.length_adaptive:
                 start_logits = outputs[1].detach()
@@ -273,8 +314,10 @@ def train(args, train_dataset, model, tokenizer):
                 for i in range(args.num_sandwich + 1):
                     inputs["output_attentions"] = True
 
+                    num_h_layers = bert.config.num_hidden_layers
+
                     layer_config = sample_layer_configuration(
-                        model.config.num_hidden_layers,
+                        num_h_layers,
                         layer_dropout_prob=args.layer_dropout_prob,
                         layer_dropout=(args.layer_dropout_bound if i == 0 else None),
                         layer_dropout_bound=args.layer_dropout_bound,
@@ -283,12 +326,30 @@ def train(args, train_dataset, model, tokenizer):
 
                     length_config = sample_length_configuration(
                         args.max_seq_length,
-                        model.config.num_hidden_layers,
+                        num_h_layers,
                         layer_config,
                         length_drop_ratio=(args.length_drop_ratio_bound if i == 0 else None),
                         length_drop_ratio_bound=args.length_drop_ratio_bound,
                     )
                     inputs["length_config"] = length_config
+
+                    head_config = sample_head_configuration(
+                        bert.config.num_attention_heads,
+                        bert.config.num_hidden_layers,
+                        layer_config,
+                        max_head_pruning= (True if i == 0 else False),
+                        random_head_pruning=True,
+                    )
+
+                    inputs["head_config"] = what_to_prune(
+                        head_importance, 
+                        head_config, 
+                        to_prune={},
+                        at_least_x_heads_per_layer=1,
+                    )
+                    
+                    #model.module.set_sample_config(to_prune) if hasattr(model, "module") else model.set_sample_config(to_prune) 
+                    #model.set_sample_config(to_prune) 
 
                     outputs_sub = model(**inputs)
                     task_loss_sub = div_loss(outputs_sub[0], args)
@@ -369,6 +430,7 @@ def train(args, train_dataset, model, tokenizer):
                         if not os.path.exists(output_dir):
                             os.makedirs(output_dir)
                         logger.info("Saving model checkpoint to %s", output_dir)
+                        model.set_nn_layer_parameters()
                         # Take care of distributed/parallel training
                         model_to_save = model.module if hasattr(model, "module") else model
                         model_to_save.save_pretrained(output_dir)
@@ -417,36 +479,37 @@ def evaluate(args, model, tokenizer, prefix=""):
         model.eval()
         batch = tuple(t.to(args.device) for t in batch)
 
-        with torch.no_grad():
-            inputs = {
-                "input_ids": batch[0],
-                "attention_mask": batch[1],
-                "token_type_ids": batch[2],
-            }
+        inputs = {
+            "input_ids": batch[0],
+            "attention_mask": batch[1],
+            "token_type_ids": batch[2],
+        }
 
-            if args.model_type in ["xlm", "roberta", "distilbert", "camembert"]:
-                del inputs["token_type_ids"]
+        if args.model_type in ["xlm", "roberta", "distilbert", "camembert"]:
+            del inputs["token_type_ids"]
 
-            example_indices = batch[3]
+        example_indices = batch[3]
 
-            # XLNet and XLM use more arguments for their predictions
-            if args.model_type in ["xlnet", "xlm"]:
-                inputs.update({"cls_index": batch[4], "p_mask": batch[5]})
-                # for lang_id-sensitive xlm models
-                if hasattr(model, "config") and hasattr(model.config, "lang2id"):
-                    inputs.update(
-                        {"langs": (torch.ones(batch[0].shape, dtype=torch.int64) * args.lang_id).to(args.device)}
-                    )
+        # XLNet and XLM use more arguments for their predictions
+        if args.model_type in ["xlnet", "xlm"]:
+            inputs.update({"cls_index": batch[4], "p_mask": batch[5]})
+            # for lang_id-sensitive xlm models
+            if hasattr(model, "config") and hasattr(model.config, "lang2id"):
+                inputs.update(
+                    {"langs": (torch.ones(batch[0].shape, dtype=torch.int64) * args.lang_id).to(args.device)}
+                )
 
-            inputs["output_attentions"] = None
-            inputs["layer_config"] = None
-            inputs["length_config"] = None
+        inputs["output_attentions"] = None
+        inputs["layer_config"] = None
+        inputs["length_config"] = None
+        inputs["head_config"] = None
+        inputs["head_prune"] = True
 
-            if args.length_config is not None:
-                inputs["output_attentions"] = True
-                inputs["length_config"] = args.length_config
+        if args.length_config is not None:
+            inputs["output_attentions"] = True
+            inputs["length_config"] = args.length_config
 
-            outputs = model(**inputs)
+        outputs = model(**inputs)
 
         for i, example_index in enumerate(example_indices):
             eval_feature = features[example_index.item()]
@@ -890,7 +953,7 @@ def main():
     if args.local_rank == 0:
         # Make sure only the first process in distributed training will download model & vocab
         torch.distributed.barrier()
-
+    
     model.to(args.device)
 
     if args.do_search:
@@ -972,6 +1035,8 @@ def main():
         logger.info("Results: {}".format(results))
 
     if args.do_search and args.local_rank in [-1, 0]:
+        model.set_nn_layer_parameters()
+        model.save_pretrained('squad_output/joint_adaptive/bert_base/checkpoint-best-nn')
         import warnings
         warnings.filterwarnings("ignore")
 

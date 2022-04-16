@@ -326,7 +326,7 @@ class LengthDropTrainer(Trainer):
                 inputs["output_attentions"] = self.length_drop_args.length_config is not None
 
                 layer_config = sample_layer_configuration(
-                    model.config.num_hidden_layers,
+                    model.module.config.num_hidden_layers if self.args.n_gpu > 1 else model.config.num_hidden_layers,
                     layer_dropout_prob=self.length_drop_args.layer_dropout_prob,
                     layer_dropout=0,
                 )
@@ -362,7 +362,7 @@ class LengthDropTrainer(Trainer):
                         inputs["output_attentions"] = True
 
                         layer_config = sample_layer_configuration(
-                            model.config.num_hidden_layers,
+                            model.module.config.num_hidden_layers if self.args.n_gpu > 1 else model.config.num_hidden_layers,
                             layer_dropout_prob=self.length_drop_args.layer_dropout_prob,
                             layer_dropout=(self.length_drop_args.layer_dropout_bound if i == 0 else None),
                             layer_dropout_bound=self.length_drop_args.layer_dropout_bound,
@@ -371,7 +371,7 @@ class LengthDropTrainer(Trainer):
 
                         length_config = sample_length_configuration(
                             self.args.max_seq_length,
-                            model.config.num_hidden_layers,
+                            model.module.config.num_hidden_layers if self.args.n_gpu > 1 else model.config.num_hidden_layers,
                             layer_config,
                             length_drop_ratio=(self.length_drop_args.length_drop_ratio_bound if i == 0 else None),
                             length_drop_ratio_bound=self.length_drop_args.length_drop_ratio_bound,
@@ -748,9 +748,15 @@ class LengthDropTrainer(Trainer):
         output_attentions = getattr(inputs, 'output_attentions', None)
         output_hidden_states = getattr(inputs, 'output_hidden_states', None)
 
+        # if self.args.n_gpu > 1:
+        #     config_output_attentions = self.model.module.config.output_attentions
+        #     config_output_hidden_states = self.model.module.config.output_hidden_states
+        # else:
+        #     config_output_attentions = self.model.config.output_attentions
+        #     config_output_hidden_states = self.model.config.output_hidden_states
+
         output_attentions = output_attentions if output_attentions is not None else self.model.config.output_attentions
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.model.config.output_hidden_states
-
         num_additional_outputs = int(output_attentions == True) + int(output_hidden_states == True)
 
         with torch.no_grad():
