@@ -242,7 +242,7 @@ def train(args, train_dataset, model, tokenizer):
             inputs["output_attentions"] = args.length_config is not None
 
             layer_config = sample_layer_configuration(
-                model.config.num_hidden_layers,
+                model.config.num_hidden_layers if not hasattr(model, "module") else model.module.config.num_hidden_layers,
                 layer_dropout_prob=args.layer_dropout_prob,
                 layer_dropout=0,
             )
@@ -274,7 +274,7 @@ def train(args, train_dataset, model, tokenizer):
                     inputs["output_attentions"] = True
 
                     layer_config = sample_layer_configuration(
-                        model.config.num_hidden_layers,
+                        model.config.num_hidden_layers if not hasattr(model, "module") else model.module.config.num_hidden_layers,
                         layer_dropout_prob=args.layer_dropout_prob,
                         layer_dropout=(args.layer_dropout_bound if i == 0 else None),
                         layer_dropout_bound=args.layer_dropout_bound,
@@ -283,7 +283,7 @@ def train(args, train_dataset, model, tokenizer):
 
                     length_config = sample_length_configuration(
                         args.max_seq_length,
-                        model.config.num_hidden_layers,
+                        model.config.num_hidden_layers if not hasattr(model, "module") else model.module.config.num_hidden_layers,
                         layer_config,
                         length_drop_ratio=(args.length_drop_ratio_bound if i == 0 else None),
                         length_drop_ratio_bound=args.length_drop_ratio_bound,
