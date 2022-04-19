@@ -24,7 +24,9 @@
 
 
 import torch
+import math
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 
 from transformers.file_utils import (
@@ -41,7 +43,6 @@ from transformers.modeling_distilbert import (
     _CONFIG_FOR_DOC,
     _TOKENIZER_FOR_DOC,
     Embeddings,
-    MultiHeadSelfAttention,
     FFN,
     DistilBertPreTrainedModel,
     DISTILBERT_START_DOCSTRING,
@@ -49,6 +50,271 @@ from transformers.modeling_distilbert import (
 )
 
 from length_adaptive_transformer.modeling_utils import expand_gather
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+
+def copy_linear_layer(source_layer, target_layer):
+    W = source_layer.weight.clone().detach()
+    if source_layer.bias is not None:
+        b = source_layer.bias.clone().detach()
+
+    target_layer.weight.requires_grad = False
+    target_layer.weight.copy_(W.contiguous())
+    target_layer.weight.requires_grad = True
+
+    if source_layer.bias is not None:
+        target_layer.bias.requires_grad = False
+        target_layer.bias.copy_(b.contiguous())
+        target_layer.bias.requires_grad = True
+
+def find_pruneable_heads_and_indices(
+    heads: List[int], n_heads: int, head_size: int, already_pruned_heads: Set[int]
+) -> Tuple[Set[int], torch.LongTensor]:
+    """
+    Finds the heads and their indices taking :obj:`already_pruned_heads` into account.
+
+    Args:
+        heads (:obj:`List[int]`): List of the indices of heads to prune.
+        n_heads (:obj:`int`): The number of heads in the model.
+        head_size (:obj:`int`): The size of each head.
+        already_pruned_heads (:obj:`Set[int]`): A set of already pruned heads.
+
+    Returns:
+        :obj:`Tuple[Set[int], torch.LongTensor]`: A tuple with the remaining heads and their corresponding indices.
+    """
+    mask = torch.ones(n_heads, head_size)
+    heads = set(heads) - already_pruned_heads  # Convert to set and remove already pruned heads
+    for head in heads:
+        # Compute how many pruned heads are before the head and move the index accordingly
+        head = head - sum(1 if h < head else 0 for h in already_pruned_heads)
+        mask[head] = 0
+    mask = mask.view(-1).contiguous().eq(1)
+    index: torch.LongTensor = torch.arange(len(mask))[mask].long()
+    return heads, index
+
+def prune_linear_layer(layer: torch.nn.Linear, index: torch.LongTensor, dim: int = 0) -> torch.nn.Linear:
+    """
+    Prune a linear layer to keep only entries in index.
+
+    Used to remove heads.
+
+    Args:
+        layer (:obj:`torch.nn.Linear`): The layer to prune.
+        index (:obj:`torch.LongTensor`): The indices to keep in the layer.
+        dim (:obj:`int`, `optional`, defaults to 0): The dimension on which to keep the indices.
+
+    Returns:
+        :obj:`torch.nn.Linear`: The pruned layer as a new layer with :obj:`requires_grad=True`.
+    """
+    index = index.to(layer.weight.device)
+    W = layer.weight.index_select(dim, index).clone().detach()
+    if layer.bias is not None:
+        if dim == 1:
+            b = layer.bias.clone().detach()
+        else:
+            b = layer.bias[index].clone().detach()
+    new_size = list(layer.weight.size())
+    new_size[dim] = len(index)
+    new_layer = nn.Linear(new_size[1], new_size[0], bias=layer.bias is not None).to(layer.weight.device)
+    new_layer.weight.requires_grad = False
+    new_layer.weight.copy_(W.contiguous())
+    new_layer.weight.requires_grad = True
+    if layer.bias is not None:
+        new_layer.bias.requires_grad = False
+        new_layer.bias.copy_(b.contiguous())
+        new_layer.bias.requires_grad = True
+    return new_layer
+
+def revert_pruned_linear_layer(base_layer: torch.nn.Linear) -> torch.nn.Linear:
+    """
+    Revert a linear layer back to the original entries before the pruning.
+
+    Used to recover heads.
+
+    Args:
+        base_layer (:obj:`torch.nn.Linear`): The layer to recover.
+
+    Returns:
+        :obj:`torch.nn.Linear`: The recovered layer as a new layer with :obj:`requires_grad=True`.
+    """
+    W = base_layer.weight.clone().detach()
+    if base_layer.bias is not None:
+        b = base_layer.bias.clone().detach()
+
+    new_size = list(base_layer.weight.size())
+    new_layer = torch.nn.Linear(new_size[1], new_size[0], bias=base_layer.bias is not None).to(base_layer.weight.device)
+    new_layer.weight.requires_grad = False
+    new_layer.weight.copy_(W.contiguous())
+    new_layer.weight.requires_grad = True
+    if base_layer.bias is not None:
+        new_layer.bias.requires_grad = False
+        new_layer.bias.copy_(b.contiguous())
+        new_layer.bias.requires_grad = True
+    return new_layer
+
+
+class LinearSuper(nn.Linear):
+    def __init__(self, super_in_dim, super_out_dim, bias=True, uniform_=None, non_linear='linear'):
+        super().__init__(super_in_dim, super_out_dim, bias=bias)
+
+        # super_in_dim and super_out_dim indicate the largest network!
+        self.super_in_dim = super_in_dim
+        self.super_out_dim = super_out_dim
+
+        self._reset_parameters(bias, uniform_, non_linear)
+
+    def _reset_parameters(self, bias, uniform_, non_linear):
+        nn.init.xavier_uniform_(self.weight) if uniform_ is None else uniform_(
+            self.weight, non_linear=non_linear)
+        if bias:
+            nn.init.constant_(self.bias, 0.)
+
+    def forward(self, x, index=None, dim=0):
+        if index is not None:
+            if dim == 0:
+                return F.linear(x, self.weight[index,:], self.bias[index])
+            else:
+                return F.linear(x, self.weight[:,index], self.bias)
+        else:
+            return F.linear(x, self.weight, self.bias)
+
+    def calc_sampled_param_num(self):
+        assert 'weight' in self.samples.keys()
+        weight_numel = self.samples['weight'].numel()
+
+        if self.samples['bias'] is not None:
+            bias_numel = self.samples['bias'].numel()
+        else:
+            bias_numel = 0
+
+        return weight_numel + bias_numel
+
+
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        self.n_heads = config.n_heads
+        self.attention_head_size = int(config.dim / config.n_heads)
+        self.dim = config.dim
+        self.dropout = nn.Dropout(p=config.attention_dropout)
+
+        self.original_n_heads = config.n_heads
+        self.original_dim = config.dim
+
+        assert self.dim % self.n_heads == 0
+
+        self.q_lin = nn.Linear(in_features=config.dim, out_features=config.dim)
+        self.k_lin = nn.Linear(in_features=config.dim, out_features=config.dim)
+        self.v_lin = nn.Linear(in_features=config.dim, out_features=config.dim)
+        self.out_lin = nn.Linear(in_features=config.dim, out_features=config.dim)
+
+        self.q_lin_f = LinearSuper(config.dim, config.dim)
+        self.k_lin_f = LinearSuper(config.dim, config.dim)
+        self.v_lin_f = LinearSuper(config.dim, config.dim)
+        self.out_lin_f = LinearSuper(config.dim, config.dim)
+
+        self.pruned_heads = set()
+
+    def set_fn_layer_parameters(self):
+        copy_linear_layer(self.q_lin, self.q_lin_f)
+        copy_linear_layer(self.k_lin, self.k_lin_f)
+        copy_linear_layer(self.v_lin, self.v_lin_f)
+        copy_linear_layer(self.out_lin, self.out_lin_f)
+
+        # self.self.query_f.set_sample_config()
+        # self.self.key_f.set_sample_config()
+        # self.self.value_f.set_sample_config()
+        # self.output.dense_f.set_sample_config()
+
+    def set_nn_layer_parameters(self):
+        copy_linear_layer(self.q_lin_f, self.q_lin)
+        copy_linear_layer(self.k_lin_f, self.k_lin)
+        copy_linear_layer(self.v_lin_f, self.v_lin)
+        copy_linear_layer(self.out_lin_f, self.out_lin)
+
+    def prune_heads(self, heads):
+        attention_head_size = self.dim // self.n_heads
+        if len(heads) == 0:
+            return
+        heads, index = find_pruneable_heads_and_indices(heads, self.n_heads, attention_head_size, self.pruned_heads)
+        # Prune linear layers
+        self.q_lin = prune_linear_layer(self.q_lin, index)
+        self.k_lin = prune_linear_layer(self.k_lin, index)
+        self.v_lin = prune_linear_layer(self.v_lin, index)
+        self.out_lin = prune_linear_layer(self.out_lin, index, dim=1)
+        # Update hyper params
+        self.n_heads = self.n_heads - len(heads)
+        self.dim = attention_head_size * self.n_heads
+        self.pruned_heads = self.pruned_heads.union(heads)
+
+    def forward(self, query, key, value, mask, head_mask=None, output_attentions=False, head_prune=False, head_index=None):
+        """
+        Parameters
+        ----------
+        query: torch.tensor(bs, seq_length, dim)
+        key: torch.tensor(bs, seq_length, dim)
+        value: torch.tensor(bs, seq_length, dim)
+        mask: torch.tensor(bs, seq_length)
+
+        Outputs
+        -------
+        weights: torch.tensor(bs, n_heads, seq_length, seq_length)
+            Attention weights
+        context: torch.tensor(bs, seq_length, dim)
+            Contextualized layer. Optional: only if `output_attentions=True`
+        """
+        bs, q_length, dim = query.size()
+        k_length = key.size(1)
+        # assert dim == self.dim, 'Dimensions do not match: %s input vs %s configured' % (dim, self.dim)
+        # assert key.size() == value.size()
+
+        #dim_per_head = self.dim // self.n_heads
+
+        mask_reshp = (bs, 1, 1, k_length)
+
+        def shape(x):
+            """ separate heads """
+            return x.view(bs, -1, self.n_heads, self.attention_head_size).transpose(1, 2)
+
+        def unshape(x):
+            """ group heads """
+            return x.transpose(1, 2).contiguous().view(bs, -1, self.n_heads * self.attention_head_size)
+
+        if head_prune:
+            q = shape(self.q_lin_f(query, head_index))  # (bs, n_heads, q_length, dim_per_head)
+            k = shape(self.k_lin_f(key, head_index))  # (bs, n_heads, k_length, dim_per_head)
+            v = shape(self.v_lin_f(value, head_index))  # (bs, n_heads, k_length, dim_per_head)
+        else:
+            q = shape(self.q_lin(query))  # (bs, n_heads, q_length, dim_per_head)
+            k = shape(self.k_lin(key))  # (bs, n_heads, k_length, dim_per_head)
+            v = shape(self.v_lin(value))  # (bs, n_heads, k_length, dim_per_head)
+
+        q = q / math.sqrt(self.attention_head_size)  # (bs, n_heads, q_length, dim_per_head)
+        scores = torch.matmul(q, k.transpose(2, 3))  # (bs, n_heads, q_length, k_length)
+        mask = (mask == 0).view(mask_reshp).expand_as(scores)  # (bs, n_heads, q_length, k_length)
+        scores.masked_fill_(mask, -float("inf"))  # (bs, n_heads, q_length, k_length)
+
+        weights = nn.Softmax(dim=-1)(scores)  # (bs, n_heads, q_length, k_length)
+        weights = self.dropout(weights)  # (bs, n_heads, q_length, k_length)
+
+        # Mask heads if we want to
+        if head_mask is not None:
+            weights = weights * head_mask
+
+        context = torch.matmul(weights, v)  # (bs, n_heads, q_length, dim_per_head)
+        self.context_layer_val = context
+        self.context_layer_val.retain_grad()
+
+        context = unshape(context)  # (bs, q_length, dim)
+        if head_prune:
+            context = self.out_lin_f(context, head_index, dim=1)  # (bs, q_length, dim)
+        else:
+            context = self.out_lin(context)  # (bs, q_length, dim)
+
+        if output_attentions:
+            return (context, weights)
+        else:
+            return (context,)
 
 
 class TransformerBlock(nn.Module):
@@ -71,6 +337,8 @@ class TransformerBlock(nn.Module):
         output_attentions=False,
         output_length=None,
         always_keep_cls_token=True,
+        head_prune=False,
+        heads=None,
     ):
         """
         Parameters
@@ -85,6 +353,15 @@ class TransformerBlock(nn.Module):
         layer_output: torch.tensor(bs, seq_length, dim)
             The output of the transformer block contextualization.
         """
+        if heads is not None:
+            heads, head_index = find_pruneable_heads_and_indices(
+                heads, self.attention.n_heads, self.attention.attention_head_size, self.attention.pruned_heads
+            )
+
+            self.attention.n_heads = self.attention.n_heads - len(heads)
+            self.attention.dim = self.attention.attention_head_size * self.attention.n_heads
+            self.attention.pruned_heads = self.attention.pruned_heads.union(heads)
+
         # Self-Attention
         self_attention_outputs = self.attention(
             query=hidden_states,
@@ -93,6 +370,8 @@ class TransformerBlock(nn.Module):
             mask=attention_mask,
             head_mask=head_mask,
             output_attentions = output_attentions,
+            head_prune=head_prune,
+            head_index=head_index if heads is not None else None,
         )
         if output_attentions:
             attention_output, attention_probs = self_attention_outputs  # (bs, seq_length, dim), (bs, n_heads, seq_length, seq_length)
@@ -122,6 +401,12 @@ class TransformerBlock(nn.Module):
         output = (layer_output,)
         if output_attentions:
             output = (attention_probs,) + output
+
+        if heads is not None:
+            self.attention.n_heads = self.attention.original_n_heads
+            self.attention.dim = self.attention.attention_head_size * self.attention.original_n_heads
+            self.pruned_heads = set()
+
         return output, keep_indices
 
 
@@ -142,7 +427,9 @@ class Transformer(nn.Module):
         return_dict=None,
         layer_config=None,
         length_config=None,
+        head_config=None,
         always_keep_cls_token=True,
+        head_prune=False,
     ):
         """
         Parameters
@@ -179,6 +466,7 @@ class Transformer(nn.Module):
 
             layer_head_mask = head_mask[i] if head_mask is not None else None
             layer_output_length = length_config[i] if length_config is not None else None
+            layer_head_prune = head_config[i] if head_config is not None else None
 
             layer_outputs, keep_indices = layer_module(
                 hidden_states,
@@ -187,6 +475,8 @@ class Transformer(nn.Module):
                 output_attentions,
                 output_length=layer_output_length,
                 always_keep_cls_token=always_keep_cls_token,
+                head_prune=head_prune,
+                heads=layer_head_prune,
             )
             hidden_states = layer_outputs[-1]
 
@@ -229,6 +519,7 @@ class DistilBertModel(DistilBertPreTrainedModel):
         self.init_weights()
 
         self.length_config = None
+        self.head_config = None
 
     def get_input_embeddings(self):
         return self.embeddings.word_embeddings
@@ -246,6 +537,19 @@ class DistilBertModel(DistilBertPreTrainedModel):
 
     def set_length_config(self, length_config):
         self.length_config = length_config
+
+    def set_head_config(self, head_config):
+        self.head_config = head_config
+
+    def set_fn_layer_parameters(self):
+        for layer in range(len(self.transformer.layer)):
+            att = self.transformer.layer[layer].attention
+            att.set_fn_layer_parameters()
+
+    def set_nn_layer_parameters(self):
+        for layer in range(len(self.transformer.layer)):
+            att = self.transformer.layer[layer].attention
+            att.set_nn_layer_parameters()
 
     @add_start_docstrings_to_callable(DISTILBERT_INPUTS_DOCSTRING.format("batch_size, num_choices"))
     @add_code_sample_docstrings(
@@ -266,7 +570,9 @@ class DistilBertModel(DistilBertPreTrainedModel):
         return_dict=None,
         layer_config=None,
         length_config=None,
+        head_config=None,
         always_keep_cls_token=True,
+        head_prune=False,
     ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -302,7 +608,9 @@ class DistilBertModel(DistilBertPreTrainedModel):
             return_dict=return_dict,
             layer_config=layer_config,
             length_config=length_config if length_config is not None else self.length_config,
+            head_config=head_config if head_config is not None else self.head_config,
             always_keep_cls_token=always_keep_cls_token,
+            head_prune=head_prune,
         )
 
 
@@ -323,6 +631,12 @@ class DistilBertForSequenceClassification(DistilBertPreTrainedModel):
 
         self.init_weights()
 
+    def set_fn_layer_parameters(self):
+        self.distilbert.set_fn_layer_parameters()
+
+    def set_nn_layer_parameters(self):
+        self.distilbert.set_nn_layer_parameters()
+
     def forward(
         self,
         input_ids=None,
@@ -335,7 +649,9 @@ class DistilBertForSequenceClassification(DistilBertPreTrainedModel):
         return_dict=None,
         layer_config=None,
         length_config=None,
+        head_config=None,
         always_keep_cls_token=True,
+        head_prune=False,
     ):
         r"""
         labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`):
@@ -356,7 +672,9 @@ class DistilBertForSequenceClassification(DistilBertPreTrainedModel):
             return_dict=return_dict,
             layer_config=layer_config,
             length_config=length_config,
+            head_config=head_config,
             always_keep_cls_token=always_keep_cls_token,
+            head_prune=head_prune,
         )
         hidden_state = distilbert_output[0]  # (bs, seq_len, dim)
         pooled_output = hidden_state[:, 0]  # (bs, dim)
@@ -409,6 +727,13 @@ class DistilBertForQuestionAnswering(DistilBertPreTrainedModel):
         output_type=QuestionAnsweringModelOutput,
         config_class=_CONFIG_FOR_DOC,
     )
+
+    def set_fn_layer_parameters(self):
+        self.distilbert.set_fn_layer_parameters()
+
+    def set_nn_layer_parameters(self):
+        self.distilbert.set_nn_layer_parameters()
+
     def forward(
         self,
         input_ids=None,
@@ -422,7 +747,9 @@ class DistilBertForQuestionAnswering(DistilBertPreTrainedModel):
         return_dict=None,
         layer_config=None,
         length_config=None,
+        head_config=None,
         always_keep_cls_token=False,
+        head_prune=False,
     ):
         r"""
         start_positions (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`):
@@ -446,7 +773,9 @@ class DistilBertForQuestionAnswering(DistilBertPreTrainedModel):
             return_dict=return_dict,
             layer_config=layer_config,
             length_config=length_config,
+            head_config=head_config,
             always_keep_cls_token=always_keep_cls_token,
+            head_prune=head_prune,
         )
         sequence_output = distilbert_output[0]  # (bs, max_query_len, dim)
 

@@ -218,7 +218,7 @@ def train(args, train_dataset, model, tokenizer):
     # Added here for reproductibility
     set_seed(args)
 
-    model_type = model.module.config.model_type if hasattr(model, "module") else model.config.num_hidden_layers
+    model_type = model.module.config.model_type if hasattr(model, "module") else model.config.model_type
 
     if model_type == "distilbert":
         bert = model.module.distilbert if hasattr(model, "module") else model.distilbert
@@ -1035,8 +1035,8 @@ def main():
         logger.info("Results: {}".format(results))
 
     if args.do_search and args.local_rank in [-1, 0]:
-        model.set_nn_layer_parameters()
-        model.save_pretrained('squad_output/joint_adaptive/bert_base/checkpoint-best-nn')
+        # model.set_nn_layer_parameters()
+        # model.save_pretrained('squad_output/joint_adaptive/bert_base/checkpoint-best-nn')
         import warnings
         warnings.filterwarnings("ignore")
 

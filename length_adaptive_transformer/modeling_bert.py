@@ -54,7 +54,6 @@ from transformers.modeling_bert import (
 from length_adaptive_transformer.modeling_utils import expand_gather
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
-
 BertLayerNorm = torch.nn.LayerNorm
 
 def copy_linear_layer(source_layer, target_layer):
@@ -155,17 +154,6 @@ def revert_pruned_linear_layer(base_layer: torch.nn.Linear) -> torch.nn.Linear:
         new_layer.bias.copy_(b.contiguous())
         new_layer.bias.requires_grad = True
     return new_layer
-
-def sample_weight(weight, sample_in_dim, sample_out_dim):
-    sample_weight = weight[:, :sample_in_dim]
-    sample_weight = sample_weight[:sample_out_dim, :]
-
-    return sample_weight
-
-def sample_bias(bias, sample_out_dim):
-    sample_bias = bias[:sample_out_dim]
-
-    return sample_bias
 
 
 class LinearSuper(nn.Linear):
