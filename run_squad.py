@@ -229,6 +229,73 @@ def train(args, train_dataset, model, tokenizer):
     else:
         bert = model.module.bert if hasattr(model, "module") else model.bert
 
+    head_importance = torch.zeros(bert.config.num_hidden_layers, bert.config.num_attention_heads).to(bert.device)
+
+    for step, batch in enumerate(train_dataloader):
+        # Skip past any already trained steps if resuming training
+        if steps_trained_in_current_epoch > 0:
+            steps_trained_in_current_epoch -= 1
+            continue
+
+        model.train()
+        batch = tuple(t.to(args.device) for t in batch)
+        inputs = {
+            "input_ids": batch[0],
+            "attention_mask": batch[1],
+            "token_type_ids": batch[2],
+            "start_positions": batch[3],
+            "end_positions": batch[4],
+        }
+        input_mask = batch[1]
+
+        if args.model_type in ["xlm", "roberta", "distilbert", "camembert"]:
+            del inputs["token_type_ids"]
+
+        if args.model_type in ["xlnet", "xlm"]:
+            inputs.update({"cls_index": batch[5], "p_mask": batch[6]})
+            if args.version_2_with_negative:
+                inputs.update({"is_impossible": batch[7]})
+            if hasattr(model, "config") and hasattr(model.config, "lang2id"):
+                inputs.update(
+                    {"langs": (torch.ones(batch[0].shape, dtype=torch.int64) * args.lang_id).to(args.device)}
+                )
+
+        inputs["output_attentions"] = args.length_config is not None
+
+        num_h_layers = bert.config.num_hidden_layers
+
+        inputs["output_attentions"] = None
+        inputs["layer_config"] = None
+        inputs["length_config"] = None
+        inputs["head_prune"] = True            
+
+        #with only layer drop
+        outputs = model(**inputs)
+        # model outputs are always tuple in transformers (see doc)
+        task_loss = div_loss(outputs[0], args)
+        loss = task_loss
+        loss.backward()
+
+        for layer in range(bert.config.num_hidden_layers):
+            self_att = bert.transformer.layer[layer].attention if model_type == "distilbert" else bert.encoder.layer[layer].attention.self
+            ctx = self_att.context_layer_val
+            grad_ctx = ctx.grad
+            # Take the dot
+            dot = torch.einsum("bhli,bhli->bhl", [grad_ctx, ctx])
+            head_importance[layer] += dot.abs().sum(-1).sum(0).detach()
+        
+        tot_tokens = input_mask.float().detach().sum().data
+    head_importance /= tot_tokens
+
+    exponent = 2
+    norm_by_layer = torch.pow(torch.pow(head_importance, exponent).sum(-1), 1/exponent)
+    head_importance /= norm_by_layer.unsqueeze(-1) + 1e-20
+
+    print("head_importance_measured!")
+    print(head_importance)
+
+    model.zero_grad()
+        
     for epoch in range(epochs_trained, int(args.num_train_epochs)):
         for step, batch in enumerate(train_dataloader):
             # Skip past any already trained steps if resuming training
@@ -291,21 +358,6 @@ def train(args, train_dataset, model, tokenizer):
             else:
                 loss.backward()
 
-            head_importance = torch.zeros(bert.config.num_hidden_layers, bert.config.num_attention_heads).to(bert.device)
-
-            for layer in range(bert.config.num_hidden_layers):
-                if layer in layer_config:
-                    self_att = bert.transformer.layer[layer].attention if model_type == "distilbert" else bert.encoder.layer[layer].attention.self
-                    ctx = self_att.context_layer_val
-                    grad_ctx = ctx.grad
-                    # Take the dot
-                    dot = torch.einsum("bhli,bhli->bhl", [grad_ctx, ctx])
-                    head_importance[layer] += dot.abs().sum(-1).sum(0).detach()
-
-            tot_tokens = input_mask.float().detach().sum().data
-            # head_importance[:-1] /= tot_tokens
-            # head_importance[-1] /= tot_tokens
-            head_importance /= tot_tokens
             # inplace distillation
             if args.length_adaptive:
                 start_logits = outputs[1].detach()

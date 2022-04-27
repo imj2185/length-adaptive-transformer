@@ -24,6 +24,8 @@
 import dataclasses
 import logging
 import os
+
+from regex import I
 os.environ["CUDA_VISIBLE_DEVICES"]='1'
 import sys
 from dataclasses import dataclass, field
@@ -49,6 +51,7 @@ from length_adaptive_transformer import (
 )
 from length_adaptive_transformer.drop_and_restore_utils import (
     sample_length_configuration,
+    sample_head_configuration,
 )
 from length_adaptive_transformer.evolution import (
     approx_ratio, inverse, store2str
@@ -196,6 +199,7 @@ def main():
         training_args.max_seq_length = data_args.max_seq_length
 
     # Initialize our Trainer
+    model.set_fn_layer_parameters()
     trainer = LengthDropTrainer(
         model=model,
         args=training_args,
@@ -238,7 +242,7 @@ def main():
 
         for eval_dataset in eval_datasets:
             trainer.compute_metrics = build_compute_metrics_fn(eval_dataset.args.task_name)
-            eval_result = trainer.evaluate(eval_dataset=eval_dataset)
+            eval_result, _ = trainer.evaluate(eval_dataset=eval_dataset)
 
             output_eval_file = os.path.join(
                 training_args.output_dir, f"eval_results_{eval_dataset.args.task_name}.txt"
@@ -295,21 +299,33 @@ def main():
             data_args.max_seq_length,
             config.num_hidden_layers,
             length_drop_ratio=length_drop_args.length_drop_ratio_bound,
+        ), sample_head_configuration(
+            config.num_attention_heads,
+            config.num_hidden_layers,
+            max_head_pruning=True,
         )
-        upper_gene = (data_args.max_seq_length,) * config.num_hidden_layers
-        trainer.add_gene(lower_gene, method=0)
-        trainer.add_gene(upper_gene, method=0)
+
+        upper_gene = (data_args.max_seq_length,) * config.num_hidden_layers, (0,) * config.num_hidden_layers
+        trainer.add_gene(lower_gene, method=0, latency=search_args.latency_constraint)
+        trainer.add_gene(upper_gene, method=0, latency=search_args.latency_constraint)
         trainer.lower_constraint = trainer.store[lower_gene][0]
         trainer.upper_constraint = trainer.store[upper_gene][0]
 
         length_drop_ratios = [inverse(r) for r in np.linspace(approx_ratio(length_drop_args.length_drop_ratio_bound), 1, search_args.population_size + 2)[1:-1]]
-        for p in length_drop_ratios:
+        head_drop_ratios = [r for r in np.linspace(1, config.num_attention_heads, search_args.population_size + 2)[1:-1]]
+        
+        for i in range(len(length_drop_ratios)):
             gene = sample_length_configuration(
                 data_args.max_seq_length,
                 config.num_hidden_layers,
-                length_drop_ratio=p,
+                length_drop_ratio=length_drop_ratios[i],
+            ), sample_head_configuration(
+                config.num_attention_heads,
+                config.num_hidden_layers,
+                max_head_pruning=True,
+                prune_ratio=head_drop_ratios[i],
             )
-            trainer.add_gene(gene, method=0)
+            trainer.add_gene(gene, method=0, latency=search_args.latency_constraint)
 
         for i in range(search_args.evo_iter + 1):
             logger.info(f"| Start Iteration {i}:")
@@ -330,12 +346,12 @@ def main():
 
             k = 0
             while k < search_args.mutation_size:
-                if trainer.mutate(search_args.mutation_prob):
+                if trainer.mutate(search_args.mutation_prob, search_args.latency_constraint):
                     k += 1
 
             k = 0
             while k < search_args.crossover_size:
-                if trainer.crossover():
+                if trainer.crossover(search_args.latency_constraint):
                     k += 1
 
     return eval_results

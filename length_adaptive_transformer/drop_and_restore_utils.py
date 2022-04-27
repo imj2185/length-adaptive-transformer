@@ -57,9 +57,13 @@ def sample_head_configuration(
     max_head_pruning=False,
     random_head_pruning=False,
     min_head=1,
+    prune_ratio=None,
 ):
-    max_pruning_configuration = [math.floor(r) for r in np.linspace(min_head, num_heads, num_hidden_layers)]
-    max_pruning_configuration[-1] -= 1
+    if prune_ratio is not None:
+        max_pruning_configuration = [math.floor(r) for r in np.linspace(min_head, prune_ratio, num_hidden_layers)]
+    else:
+        max_pruning_configuration = [math.floor(r) for r in np.linspace(min_head, num_heads, num_hidden_layers)]
+        max_pruning_configuration[-1] -= 1
     
     head = 0
     head_configuration = ()
@@ -170,6 +174,7 @@ def add_drop_and_restore_args(parser):
 class SearchArguments:
     do_search: Optional[bool] = field(default=False)
     do_ray_search: Optional[bool] = field(default=False)
+    latency_constraint: Optional[bool] = field(default=False)
     load_store_file: Optional[str] = field(default=None)
     evo_iter: Optional[int] = field(default=100)
     population_size: Optional[int] = field(default=20)
@@ -180,6 +185,7 @@ class SearchArguments:
 
 def add_search_args(parser):
     parser.add_argument("--do_search", action="store_true")
+    parser.add_argument("--latency_constraint", action="store_true")
     parser.add_argument("--load_store_file", default=None, type=str)
     parser.add_argument("--evo_iter", default=100, type=int)
     parser.add_argument("--population_size", default=20, type=int)

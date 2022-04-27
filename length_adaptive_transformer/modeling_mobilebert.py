@@ -39,22 +39,37 @@ from transformers.modeling_outputs import (
     QuestionAnsweringModelOutput,
 )
 from transformers.modeling_utils import apply_chunking_to_forward
-from transformers.modeling_bert import (
-    _CONFIG_FOR_DOC,
+
+from transformers.modeling_mobilebert import (
+    MobileBertPreTrainedModel,
+    MOBILEBERT_INPUTS_DOCSTRING,
+    MOBILEBERT_START_DOCSTRING,
     _TOKENIZER_FOR_DOC,
-    BertEmbeddings,
-    BertIntermediate,
-    BertOutput,
-    BertPooler,
-    BertPreTrainedModel,
-    BERT_START_DOCSTRING,
-    BERT_INPUTS_DOCSTRING,
+    _CONFIG_FOR_DOC,
+    MobileBertEmbeddings,
+    MobileBertPooler,
+    MobileBertSelfOutput,
+    MobileBertOutput,
+    MobileBertIntermediate,
+    Bottleneck,
 )
 
 from length_adaptive_transformer.modeling_utils import expand_gather
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 BertLayerNorm = torch.nn.LayerNorm
+
+class NoNorm(nn.Module):
+    def __init__(self, feat_size, eps=None):
+        super().__init__()
+        self.bias = nn.Parameter(torch.zeros(feat_size))
+        self.weight = nn.Parameter(torch.ones(feat_size))
+
+    def forward(self, input_tensor):
+        return input_tensor * self.weight + self.bias
+
+
+NORM2FN = {"layer_norm": nn.LayerNorm, "no_norm": NoNorm}
 
 def copy_linear_layer(source_layer, target_layer):
     W = source_layer.weight.clone().detach()
@@ -193,30 +208,28 @@ class LinearSuper(nn.Linear):
         return weight_numel + bias_numel
 
 
-class BertSelfAttention(nn.Module):
+class MobileBertSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
-        if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
-            raise ValueError(
-                "The hidden size (%d) is not a multiple of the number of attention "
-                "heads (%d)" % (config.hidden_size, config.num_attention_heads)
-            )
+
         self.original_num_attention_heads = config.num_attention_heads
         self.original_attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.original_all_head_size = self.original_num_attention_heads * self.original_attention_head_size
 
         self.num_attention_heads = config.num_attention_heads
-        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
+        self.attention_head_size = int(config.true_hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
         self.pruned_heads = set()
 
-        self.query = nn.Linear(config.hidden_size, self.all_head_size)
-        self.key = nn.Linear(config.hidden_size, self.all_head_size)
-        self.value = nn.Linear(config.hidden_size, self.all_head_size)
+        self.query = nn.Linear(config.true_hidden_size, self.all_head_size)
+        self.key = nn.Linear(config.true_hidden_size, self.all_head_size)
+        self.value = nn.Linear(
+            config.true_hidden_size if config.use_bottleneck_attention else config.hidden_size, self.all_head_size
+        )
 
         self.query_f = LinearSuper(config.hidden_size, self.all_head_size)
         self.key_f = LinearSuper(config.hidden_size, self.all_head_size)
-        self.value_f = LinearSuper(config.hidden_size, self.all_head_size)
+        self.value_f = LinearSuper(config.true_hidden_size if config.use_bottleneck_attention else config.hidden_size, self.all_head_size)
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
@@ -227,38 +240,25 @@ class BertSelfAttention(nn.Module):
 
     def forward(
         self,
-        hidden_states,
+        query_tensor,
+        key_tensor,
+        value_tensor,
         attention_mask=None,
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
-        output_attentions=False,
+        output_attentions=None,
         head_prune=False,
         head_index=None,
     ):
         if head_prune:
-            mixed_query_layer = self.query_f(hidden_states, head_index)
+            mixed_query_layer = self.query_f(query_tensor)
+            mixed_key_layer = self.key_f(key_tensor)
+            mixed_value_layer = self.value_f(value_tensor)
         else:
-            mixed_query_layer = self.query(hidden_states)
-
-        # If this is instantiated as a cross-attention module, the keys
-        # and values come from an encoder; the attention mask needs to be
-        # such that the encoder's padding tokens are not attended to.
-        if encoder_hidden_states is not None:
-            if head_prune:
-                mixed_key_layer = self.key_f(encoder_hidden_states, head_index)
-                mixed_value_layer = self.value_f(encoder_hidden_states, head_index)
-            else:
-                mixed_key_layer = self.key(encoder_hidden_states)
-                mixed_value_layer = self.value(encoder_hidden_states)
-            attention_mask = encoder_attention_mask
-        else:
-            if head_prune:
-                mixed_key_layer = self.key_f(hidden_states, head_index)
-                mixed_value_layer = self.value_f(hidden_states, head_index)
-            else:
-                mixed_key_layer = self.key(hidden_states)
-                mixed_value_layer = self.value(hidden_states)
+            mixed_query_layer = self.query(query_tensor)
+            mixed_key_layer = self.key(key_tensor)
+            mixed_value_layer = self.value(value_tensor)
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
         key_layer = self.transpose_for_scores(mixed_key_layer)
@@ -270,18 +270,14 @@ class BertSelfAttention(nn.Module):
         if attention_mask is not None:
             # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
             attention_scores = attention_scores + attention_mask
-
         # Normalize the attention scores to probabilities.
         attention_probs = nn.Softmax(dim=-1)(attention_scores)
-
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
         attention_probs = self.dropout(attention_probs)
-
         # Mask heads if we want to
         if head_mask is not None:
             attention_probs = attention_probs * head_mask
-
         context_layer = torch.matmul(attention_probs, value_layer)
         self.context_layer_val = context_layer
         self.context_layer_val.retain_grad()
@@ -289,7 +285,6 @@ class BertSelfAttention(nn.Module):
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(*new_context_layer_shape)
-
         outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
         return outputs
 
@@ -312,11 +307,11 @@ class BertSelfOutput(nn.Module):
         return hidden_states
 
 
-class BertAttention(nn.Module):
+class MobileBertAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.self = BertSelfAttention(config)
-        self.output = BertSelfOutput(config)
+        self.self = MobileBertSelfAttention(config)
+        self.output = MobileBertSelfOutput(config)
         self.pruned_heads = set()
 
     def set_fn_layer_parameters(self):
@@ -325,34 +320,11 @@ class BertAttention(nn.Module):
         copy_linear_layer(self.self.value, self.self.value_f)
         copy_linear_layer(self.output.dense, self.output.dense_f)
 
-        # self.self.query_f.set_sample_config()
-        # self.self.key_f.set_sample_config()
-        # self.self.value_f.set_sample_config()
-        # self.output.dense_f.set_sample_config()
-
     def set_nn_layer_parameters(self):
         copy_linear_layer(self.self.query_f, self.self.query)
         copy_linear_layer(self.self.key_f, self.self.key)
         copy_linear_layer(self.self.value_f, self.self.value)
         copy_linear_layer(self.output.dense_f, self.output.dense)
-
-    def set_sample_config(self, heads):
-        self.self.num_attention_heads = self.self.original_num_attention_heads
-        self.self.all_head_size = self.self.original_all_head_size
-        self.pruned_heads = set()
-
-        heads, index = find_pruneable_heads_and_indices(
-            heads, self.self.num_attention_heads, self.self.attention_head_size, self.pruned_heads
-        )
-
-        self.self.query_f.set_sample_config(index, prune=True)
-        self.self.key_f.set_sample_config(index, prune=True)
-        self.self.value_f.set_sample_config(index, prune=True)
-        self.output.dense_f.set_sample_config(index, dim=1, prune=True)
-
-        self.self.num_attention_heads = self.self.num_attention_heads - len(heads)
-        self.self.all_head_size = self.self.attention_head_size * self.self.num_attention_heads
-        self.pruned_heads = self.pruned_heads.union(heads)
 
     def prune_heads(self, heads):
         if len(heads) == 0:
@@ -386,12 +358,15 @@ class BertAttention(nn.Module):
 
     def forward(
         self,
-        hidden_states,
+        query_tensor,
+        key_tensor,
+        value_tensor,
+        layer_input,
         attention_mask=None,
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
-        output_attentions=False,
+        output_attentions=None,
         head_prune=False,
         heads=None,
     ):
@@ -405,7 +380,9 @@ class BertAttention(nn.Module):
             self.pruned_heads = self.pruned_heads.union(heads)
 
         self_outputs = self.self(
-            hidden_states,
+            query_tensor,
+            key_tensor,
+            value_tensor,
             attention_mask,
             head_mask,
             encoder_hidden_states,
@@ -414,29 +391,55 @@ class BertAttention(nn.Module):
             head_prune=head_prune,
             head_index=head_index if heads is not None else None,
         )
-        attention_output = self.output(self_outputs[0], hidden_states, head_prune=head_prune, head_index=head_index if heads is not None else None,)
+        # Run a linear projection of `hidden_size` then add a residual
+        # with `layer_input`.
+        attention_output = self.output(self_outputs[0], layer_input)
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
         if heads is not None:
             self.self.num_attention_heads = self.self.original_num_attention_heads
             self.self.all_head_size = self.self.original_attention_head_size * self.self.original_num_attention_heads
             self.pruned_heads = set()
-            
+
         return outputs
 
 
-class BertLayer(nn.Module):
+class FFNOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.chunk_size_feed_forward = config.chunk_size_feed_forward
-        self.seq_len_dim = 1
-        self.attention = BertAttention(config)
-        self.is_decoder = config.is_decoder
-        self.add_cross_attention = config.add_cross_attention
-        if self.add_cross_attention:
-            assert self.is_decoder, f"{self} should be used as a decoder model if cross attention is added"
-            self.crossattention = BertAttention(config)
-        self.intermediate = BertIntermediate(config)
-        self.output = BertOutput(config)
+        self.dense = nn.Linear(config.intermediate_size, config.true_hidden_size)
+        self.LayerNorm = NORM2FN[config.normalization_type](config.true_hidden_size, eps=config.layer_norm_eps)
+
+    def forward(self, hidden_states, residual_tensor):
+        layer_outputs = self.dense(hidden_states)
+        layer_outputs = self.LayerNorm(layer_outputs + residual_tensor)
+        return layer_outputs
+
+
+class FFNLayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.intermediate = MobileBertIntermediate(config)
+        self.output = FFNOutput(config)
+
+    def forward(self, hidden_states):
+        intermediate_output = self.intermediate(hidden_states)
+        layer_outputs = self.output(intermediate_output, hidden_states)
+        return layer_outputs
+
+
+class MobileBertLayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.use_bottleneck = config.use_bottleneck
+        self.num_feedforward_networks = config.num_feedforward_networks
+
+        self.attention = MobileBertAttention(config)
+        self.intermediate = MobileBertIntermediate(config)
+        self.output = MobileBertOutput(config)
+        if self.use_bottleneck:
+            self.bottleneck = Bottleneck(config)
+        if config.num_feedforward_networks > 1:
+            self.ffn = nn.ModuleList([FFNLayer(config) for _ in range(config.num_feedforward_networks - 1)])
 
     def forward(
         self,
@@ -445,14 +448,22 @@ class BertLayer(nn.Module):
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
-        output_attentions=False,
+        output_attentions=None,
         output_length=None,
         always_keep_cls_token=True,
         head_prune=False,
         head_index=None
     ):
+        if self.use_bottleneck:
+            query_tensor, key_tensor, value_tensor, layer_input = self.bottleneck(hidden_states)
+        else:
+            query_tensor, key_tensor, value_tensor, layer_input = [hidden_states] * 4
+
         self_attention_outputs = self.attention(
-            hidden_states,
+            query_tensor,
+            key_tensor,
+            value_tensor,
+            layer_input,
             attention_mask,
             head_mask,
             output_attentions=output_attentions,
@@ -460,22 +471,8 @@ class BertLayer(nn.Module):
             heads=head_index,
         )
         attention_output = self_attention_outputs[0]
+        s = (attention_output,)
         outputs = self_attention_outputs[1:]  # add self attentions if we output attention weights
-
-        if self.is_decoder and encoder_hidden_states is not None:
-            assert hasattr(
-                self, "crossattention"
-            ), f"If `encoder_hidden_states` are passed, {self} has to be instantiated with cross-attention layers by setting `config.add_cross_attention=True`"
-            cross_attention_outputs = self.crossattention(
-                attention_output,
-                attention_mask,
-                head_mask,
-                encoder_hidden_states,
-                encoder_attention_mask,
-                output_attentions,
-            )
-            attention_output = cross_attention_outputs[0]
-            outputs = outputs + cross_attention_outputs[1:]  # add cross attentions if we output attention weights
 
         if output_length is not None:
             assert output_attentions
@@ -489,26 +486,38 @@ class BertLayer(nn.Module):
                 keep_indices = significance_score.topk(output_length, 1)[1]
             # keep_indices = keep_indices.sort(1)[0]
             attention_output = expand_gather(attention_output, 1, keep_indices.unsqueeze(-1))
+            hidden_states = expand_gather(hidden_states, 1, keep_indices.unsqueeze(-1))
         else:
             keep_indices = None
+            
+        if self.num_feedforward_networks != 1:
+            for i, ffn_module in enumerate(self.ffn):
+                attention_output = ffn_module(attention_output)
+                s += (attention_output,)
 
-        layer_output = apply_chunking_to_forward(
-            self.feed_forward_chunk, self.chunk_size_feed_forward, self.seq_len_dim, attention_output
+        intermediate_output = self.intermediate(attention_output)
+        layer_output = self.output(intermediate_output, attention_output, hidden_states)
+        outputs = (
+            (layer_output,)
+            + outputs
+            + (
+                torch.tensor(1000),
+                query_tensor,
+                key_tensor,
+                value_tensor,
+                layer_input,
+                attention_output,
+                intermediate_output,
+            )
+            + s
         )
-        outputs = (layer_output,) + outputs
         return outputs, keep_indices
 
-    def feed_forward_chunk(self, attention_output):
-        intermediate_output = self.intermediate(attention_output)
-        layer_output = self.output(intermediate_output, attention_output)
-        return layer_output
 
-
-class BertEncoder(nn.Module):
+class MobileBertEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.config = config
-        self.layer = nn.ModuleList([BertLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layer = nn.ModuleList([MobileBertLayer(config) for _ in range(config.num_hidden_layers)])
 
     def forward(
         self,
@@ -533,8 +542,6 @@ class BertEncoder(nn.Module):
             remain_indices = torch.arange(tsz, device=hidden_states.device).unsqueeze(0).repeat(bsz, 1)
 
         all_hidden_states = () if output_hidden_states else None
-        if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_states, )
         all_attentions = () if output_attentions else None
         for i, layer_module in enumerate(self.layer):
             if layer_config is not None and i not in layer_config:
@@ -543,36 +550,22 @@ class BertEncoder(nn.Module):
             layer_head_mask = head_mask[i] if head_mask is not None else None
             layer_output_length = length_config[i] if length_config is not None else None
             layer_head_prune = head_config[i] if head_config is not None else None
+            
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
 
-            if getattr(self.config, "gradient_checkpointing", False):
-
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        return module(*inputs, output_attentions, layer_output_length, always_keep_cls_token)
-
-                    return custom_forward
-
-                layer_outputs, keep_indices = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(layer_module),
-                    hidden_states,
-                    attention_mask,
-                    layer_head_mask,
-                    encoder_hidden_states,
-                    encoder_attention_mask,
-                )
-            else:
-                layer_outputs, keep_indices = layer_module(
-                    hidden_states,
-                    attention_mask,
-                    layer_head_mask,
-                    encoder_hidden_states,
-                    encoder_attention_mask,
-                    output_attentions,
-                    output_length=layer_output_length,
-                    always_keep_cls_token=always_keep_cls_token,
-                    head_prune=head_prune,
-                    head_index=layer_head_prune
-                )
+            layer_outputs, keep_indices = layer_module(
+                hidden_states,
+                attention_mask,
+                layer_head_mask,
+                encoder_hidden_states,
+                encoder_attention_mask,
+                output_attentions,
+                output_length=layer_output_length,
+                always_keep_cls_token=always_keep_cls_token,
+                head_prune=head_prune,
+                head_index=layer_head_prune
+            )
             hidden_states = layer_outputs[0]
 
             if layer_output_length:
@@ -584,48 +577,38 @@ class BertEncoder(nn.Module):
                     if attention_mask.size(2) > 1:
                         attention_mask = expand_gather(attention_mask, 2, keep_indices.unsqueeze(1).unsqueeze(3))
 
-            if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
-
             if output_attentions:
                 all_attentions = all_attentions + (layer_outputs[1],)
 
+        # Add last layer
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+
         last_hidden_state = restored_hidden_states if length_config is not None else hidden_states
         if not return_dict:
-            return tuple(v for v in [last_hidden_state, all_hidden_states, all_attentions] if v is not None)
+            return tuple(v for v in [hidden_states, all_hidden_states, all_attentions] if v is not None)
         return BaseModelOutput(
-            last_hidden_state=last_hidden_state, hidden_states=all_hidden_states, attentions=all_attentions
+            last_hidden_state=hidden_states, hidden_states=all_hidden_states, attentions=all_attentions
         )
 
 
 @add_start_docstrings(
-    "The bare Bert Model transformer outputting raw hidden-states without any specific head on top.",
-    BERT_START_DOCSTRING,
+    "The bare MobileBert Model transformer outputting raw hidden-states without any specific head on top.",
+    MOBILEBERT_START_DOCSTRING,
 )
-class BertModel(BertPreTrainedModel):
+class MobileBertModel(MobileBertPreTrainedModel):
+    """
+    https://arxiv.org/pdf/2004.02984.pdf
     """
 
-    The model can behave as an encoder (with only self-attention) as well
-    as a decoder, in which case a layer of cross-attention is added between
-    the self-attention layers, following the architecture described in `Attention is all you need
-    <https://arxiv.org/abs/1706.03762>`__ by Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones,
-    Aidan N. Gomez, Lukasz Kaiser and Illia Polosukhin.
+    authorized_missing_keys = [r"position_ids"]
 
-    To behave as an decoder the model needs to be initialized with the
-    :obj:`is_decoder` argument of the configuration set to :obj:`True`.
-    To be used in a Seq2Seq model, the model needs to initialized with both :obj:`is_decoder`
-    argument and :obj:`add_cross_attention` set to :obj:`True`; an
-    :obj:`encoder_hidden_states` is then expected as an input to the forward pass.
-    """
-
-    def __init__(self, config, add_pooling_layer=True):
+    def __init__(self, config):
         super().__init__(config)
         self.config = config
-
-        self.embeddings = BertEmbeddings(config)
-        self.encoder = BertEncoder(config)
-
-        self.pooler = BertPooler(config) if add_pooling_layer else None
+        self.embeddings = MobileBertEmbeddings(config)
+        self.encoder = MobileBertEncoder(config)
+        self.pooler = MobileBertPooler(config)
 
         self.init_weights()
 
@@ -652,20 +635,13 @@ class BertModel(BertPreTrainedModel):
     def set_head_config(self, head_config):
         self.head_config = head_config
 
-    @add_start_docstrings_to_callable(BERT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
+    @add_start_docstrings_to_callable(MOBILEBERT_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         tokenizer_class=_TOKENIZER_FOR_DOC,
-        checkpoint="bert-base-uncased",
+        checkpoint="google/mobilebert-uncased",
         output_type=BaseModelOutputWithPooling,
         config_class=_CONFIG_FOR_DOC,
     )
-
-    def set_sample_config(self, to_mask):
-        for layer in range(len(self.encoder.layer)):
-            if layer in to_mask:
-                heads = to_mask[layer]
-                att = self.encoder.layer[layer].attention
-                att.set_sample_config(heads)
 
     def set_fn_layer_parameters(self):
         for layer in range(len(self.encoder.layer)):
@@ -726,8 +702,8 @@ class BertModel(BertPreTrainedModel):
         inputs_embeds=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
-        output_attentions=None,
         output_hidden_states=None,
+        output_attentions=None,
         return_dict=None,
         layer_config=None,
         length_config=None,
@@ -735,18 +711,6 @@ class BertModel(BertPreTrainedModel):
         always_keep_cls_token=True,
         head_prune=False,
     ):
-        r"""
-        encoder_hidden_states  (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length, hidden_size)`, `optional`):
-            Sequence of hidden-states at the output of the last layer of the encoder. Used in the cross-attention
-            if the model is configured as a decoder.
-        encoder_attention_mask (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
-            Mask to avoid performing attention on the padding token indices of the encoder input. This mask
-            is used in the cross-attention if the model is configured as a decoder.
-            Mask values selected in ``[0, 1]``:
-
-            - 1 for tokens that are **not masked**,
-            - 0 for tokens that are **maked**.
-        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -771,10 +735,12 @@ class BertModel(BertPreTrainedModel):
 
         # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
         # ourselves in which case we just need to make it broadcastable to all heads.
-        extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(attention_mask, input_shape, device)
+        extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(
+            attention_mask, input_shape, self.device
+        )
 
-        # If a 2D or 3D attention mask is provided for the cross-attention
-        # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
+        # If a 2D ou 3D attention mask is provided for the cross-attention
+        # we need to make broadcastabe to [batch_size, num_heads, seq_length, seq_length]
         if self.config.is_decoder and encoder_hidden_states is not None:
             encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
             encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
@@ -810,7 +776,7 @@ class BertModel(BertPreTrainedModel):
             head_prune=head_prune,
         )
         sequence_output = encoder_outputs[0]
-        pooled_output = self.pooler(sequence_output) if self.pooler is not None else None
+        pooled_output = self.pooler(sequence_output)
 
         if not return_dict:
             return (sequence_output, pooled_output) + encoder_outputs[1:]
@@ -824,31 +790,27 @@ class BertModel(BertPreTrainedModel):
 
 
 @add_start_docstrings(
-    """Bert Model transformer with a sequence classification/regression head on top (a linear layer on top of
+    """MobileBert Model transformer with a sequence classification/regression head on top (a linear layer on top of
     the pooled output) e.g. for GLUE tasks. """,
-    BERT_START_DOCSTRING,
+    MOBILEBERT_START_DOCSTRING,
 )
-class BertForSequenceClassification(BertPreTrainedModel):
+class MobileBertForSequenceClassification(MobileBertPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
-
-        self.bert = BertModel(config)
+        self.mobilebert = MobileBertModel(config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+        self.classifier = nn.Linear(config.hidden_size, self.num_labels)
 
         self.init_weights()
 
-    @add_start_docstrings_to_callable(BERT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
+    @add_start_docstrings_to_callable(MOBILEBERT_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         tokenizer_class=_TOKENIZER_FOR_DOC,
-        checkpoint="bert-base-uncased",
+        checkpoint="google/mobilebert-uncased",
         output_type=SequenceClassifierOutput,
         config_class=_CONFIG_FOR_DOC,
     )
-
-    def set_sample_config(self, head_config):
-        self.bert.set_sample_config(head_config)
 
     def set_fn_layer_parameters(self):
         self.bert.set_fn_layer_parameters()
@@ -883,7 +845,7 @@ class BertForSequenceClassification(BertPreTrainedModel):
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        outputs = self.bert(
+        outputs = self.mobilebert(
             input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
@@ -899,9 +861,7 @@ class BertForSequenceClassification(BertPreTrainedModel):
             always_keep_cls_token=always_keep_cls_token,
             head_prune=head_prune,
         )
-
         pooled_output = outputs[1]
-
         pooled_output = self.dropout(pooled_output)
         logits = self.classifier(pooled_output)
 
@@ -928,33 +888,27 @@ class BertForSequenceClassification(BertPreTrainedModel):
 
 
 @add_start_docstrings(
-    """Bert Model with a span classification head on top for extractive question-answering tasks like SQuAD (a linear
+    """MobileBert Model with a span classification head on top for extractive question-answering tasks like SQuAD (a linear
     layers on top of the hidden-states output to compute `span start logits` and `span end logits`). """,
-    BERT_START_DOCSTRING,
+    MOBILEBERT_START_DOCSTRING,
 )
-class BertForQuestionAnswering(BertPreTrainedModel):
-
-    authorized_unexpected_keys = [r"pooler"]
-
+class MobileBertForQuestionAnswering(MobileBertPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
 
-        self.bert = BertModel(config, add_pooling_layer=False)
+        self.mobilebert = MobileBertModel(config)
         self.qa_outputs = nn.Linear(config.hidden_size, config.num_labels)
 
         self.init_weights()
 
-    @add_start_docstrings_to_callable(BERT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
+    @add_start_docstrings_to_callable(MOBILEBERT_INPUTS_DOCSTRING.format("(batch_size, sequence_length)"))
     @add_code_sample_docstrings(
         tokenizer_class=_TOKENIZER_FOR_DOC,
-        checkpoint="bert-base-uncased",
+        checkpoint="google/mobilebert-uncased",
         output_type=QuestionAnsweringModelOutput,
         config_class=_CONFIG_FOR_DOC,
     )
-
-    def set_sample_config(self, head_config):
-        self.bert.set_sample_config(head_config)
 
     def set_fn_layer_parameters(self):
         self.bert.set_fn_layer_parameters()
@@ -984,16 +938,16 @@ class BertForQuestionAnswering(BertPreTrainedModel):
         r"""
         start_positions (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`):
             Labels for position (index) of the start of the labelled span for computing the token classification loss.
-            Positions are clamped to the length of the sequence (:obj:`sequence_length`).
+            Positions are clamped to the length of the sequence (`sequence_length`).
             Position outside of the sequence are not taken into account for computing the loss.
         end_positions (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`):
             Labels for position (index) of the end of the labelled span for computing the token classification loss.
-            Positions are clamped to the length of the sequence (:obj:`sequence_length`).
+            Positions are clamped to the length of the sequence (`sequence_length`).
             Position outside of the sequence are not taken into account for computing the loss.
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        outputs = self.bert(
+        outputs = self.mobilebert(
             input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,

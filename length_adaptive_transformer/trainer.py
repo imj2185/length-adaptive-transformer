@@ -24,6 +24,8 @@ The Trainer class, to easily train a 🤗 Transformers from scratch or finetune 
 import csv
 import os
 import random
+import math
+import timeit
 import warnings
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -113,6 +115,79 @@ from length_adaptive_transformer.evolution import store2str
 
 logger = logging.get_logger(__name__)
 
+def sample_head_configuration(
+    num_heads,
+    num_hidden_layers,
+    layer_config=None,
+    max_head_pruning=False,
+    random_head_pruning=False,
+    min_head=1,
+):
+    max_pruning_configuration = [math.floor(r) for r in np.linspace(min_head, num_heads, num_hidden_layers)]
+    max_pruning_configuration[-1] -= 1
+    
+    head = 0
+    head_configuration = ()
+    for i in range(num_hidden_layers):
+        if layer_config is None or i in layer_config:
+            if max_head_pruning:
+                head = max_pruning_configuration[i]
+            elif random_head_pruning:
+                head = np.random.randint(head, max_pruning_configuration[i])
+        head_configuration += (head,)
+    return head_configuration
+
+def what_to_prune(
+    head_importance,
+    gene,
+    to_prune=None,
+    at_least_x_heads_per_layer=0,
+    rescale_by_number=False,
+):
+    head_importance = head_importance.clone()
+    n_layers, n_heads = head_importance.size()
+    to_prune = to_prune or {}
+    if rescale_by_number:
+        for layer in to_prune:
+            #head_importance[layer] *= sqrt(n_layers / len(to_prune[layer]))
+            head_importance[layer] *= math.sqrt(len(to_prune[layer]) / n_layers)
+    # Sort heads by score
+    heads_and_score = [
+        ((layer, head), head_importance[layer, head])
+        for layer in range(n_layers)
+        for head in range(n_heads)
+    ]
+    heads_and_score = sorted(heads_and_score, key=lambda x: x[1])
+    sorted_heads = [head_and_score[0]
+                    for head_and_score in heads_and_score]
+    # Ensure we don't delete all heads in a layer
+    if at_least_x_heads_per_layer:
+        # Remove the top scoring head in each layer
+        to_protect = {l: 0 for l in range(n_layers)}
+        filtered_sorted_heads = []
+        for layer, head in reversed(sorted_heads):
+            if layer in to_protect:
+                if to_protect[layer] < at_least_x_heads_per_layer:
+                    to_protect[layer] += 1
+                    continue
+                else:
+                    to_protect.pop(layer)
+            filtered_sorted_heads.insert(0, (layer, head))
+        sorted_heads = filtered_sorted_heads
+    # layer/heads that were already pruned
+    # Prune the lowest scoring heads
+    sorted_heads = [
+        (layer, head)
+        for (layer, head) in sorted_heads
+        if layer not in to_prune or head not in to_prune[layer]
+    ]
+    # Update heads to prune
+    for layer, head in sorted_heads:
+        if layer not in to_prune:
+            to_prune[layer] = []
+        if len(to_prune[layer]) < gene[layer]:
+            to_prune[layer].append(head)
+    return to_prune
 
 class LengthDropTrainer(Trainer):
     def __init__(
@@ -295,6 +370,16 @@ class LengthDropTrainer(Trainer):
         model.zero_grad()
         disable_tqdm = self.args.disable_tqdm or not self.is_local_process_zero()
         train_pbar = trange(epochs_trained, int(np.ceil(num_train_epochs)), desc="Epoch", disable=disable_tqdm)
+        
+        if "distilbert" in model_path:
+            bert = model.module.distilbert if hasattr(model, "module") else model.distilbert
+        elif "roberta" in model_path:
+            bert = model.module.roberta if hasattr(model, "module") else model.roberta
+        elif "mobilebert" in model_path:
+            bert = model.module.mobilebert if hasattr(model, "module") else model.mobilebert
+        else:
+            bert = model.module.bert if hasattr(model, "module") else model.bert
+
         for epoch in range(epochs_trained, int(np.ceil(num_train_epochs))):
             if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
                 train_dataloader.sampler.set_epoch(epoch)
@@ -331,6 +416,7 @@ class LengthDropTrainer(Trainer):
                     layer_dropout=0,
                 )
                 inputs["layer_config"] = layer_config
+                inputs["head_prune"] = True
 
                 inputs["length_config"] = self.length_drop_args.length_config
 
@@ -354,6 +440,19 @@ class LengthDropTrainer(Trainer):
                 else:
                     loss.backward()
 
+                head_importance = torch.zeros(model.config.num_hidden_layers, model.config.num_attention_heads).to(model.device)
+
+                for layer in range(model.config.num_hidden_layers):
+                    if layer in layer_config:
+                        self_att = bert.transformer.layer[layer].attention if "distilbert" in model_path else bert.encoder.layer[layer].attention.self
+                        ctx = self_att.context_layer_val
+                        grad_ctx = ctx.grad
+                        # Take the dot
+                        dot = torch.einsum("bhli,bhli->bhl", [grad_ctx, ctx])
+                        head_importance[layer] += dot.abs().sum(-1).sum(0).detach()
+
+                tot_tokens = inputs["attention_mask"].float().detach().sum().data
+                head_importance /= tot_tokens
                 # inplace distillation
                 if self.length_drop_args.length_adaptive:
                     logits = outputs[1].detach()
@@ -377,6 +476,21 @@ class LengthDropTrainer(Trainer):
                             length_drop_ratio_bound=self.length_drop_args.length_drop_ratio_bound,
                         )
                         inputs["length_config"] = length_config
+
+                        head_config = sample_head_configuration(
+                        bert.config.num_attention_heads,
+                        bert.config.num_hidden_layers,
+                        layer_config,
+                        max_head_pruning= (True if i == 0 else False),
+                        random_head_pruning=True,
+                        )
+
+                        inputs["head_config"] = what_to_prune(
+                            head_importance, 
+                            head_config, 
+                            to_prune={},
+                            at_least_x_heads_per_layer=1,
+                        )
 
                         outputs_sub = model(**inputs)
                         task_loss_sub = self.div_loss(outputs_sub[0])
@@ -491,8 +605,9 @@ class LengthDropTrainer(Trainer):
                             output_dirs = [os.path.join(self.args.output_dir, checkpoint_folder)]
                             
                         if self.args.evaluate_during_training:
-                            if best[self.best_metric] is None or results[self.best_metric] > best[self.best_metric]:
+                            if best[self.best_metric] is None or results[self.best_metric] >= best[self.best_metric]:
                                 logger.info("Congratulations, best model so far!")
+                                model.set_nn_layer_parameters()
                                 output_dirs.append(os.path.join(self.args.output_dir, "checkpoint-best"))
                                 best = results
 
@@ -581,7 +696,7 @@ class LengthDropTrainer(Trainer):
         if self.is_world_process_zero():
             self.log_history.append(output)
 
-    def evaluate(self, eval_dataset: Optional[Dataset] = None) -> Dict[str, float]:
+    def evaluate(self, eval_dataset: Optional[Dataset] = None, head_prune: Optional[bool] = None, evo_search: Optional[bool] = None) -> Dict[str, float]:
         """
         Run evaluation and returns metrics.
 
@@ -600,16 +715,158 @@ class LengthDropTrainer(Trainer):
         """
         eval_dataloader = self.get_eval_dataloader(eval_dataset)
 
-        output = self.prediction_loop(eval_dataloader, description="Evaluation")
+        output, latency = self.prediction_loop(eval_dataloader, description="Evaluation", head_prune=head_prune)
 
         if self.args.tpu_metrics_debug or self.args.debug:
             # tpu-comment: Logging debug metrics for PyTorch/XLA (compile, execute times, ops, etc.)
             xm.master_print(met.metrics_report())
 
-        return output.metrics
+        if evo_search is not None:
+            return output.metrics, latency
+        else:
+            return output.metrics
+
+    def get_head_importance(self, eval_dataset=None, model_type=None):
+        """
+        Run evaluation and returns metrics.
+
+        The calling script will be responsible for providing a method to compute metrics, as they are
+        task-dependent (pass it to the init :obj:`compute_metrics` argument).
+
+        You can also subclass and override this method to inject custom behavior.
+
+        Args:
+            eval_dataset (:obj:`Dataset`, `optional`):
+                Pass a dataset if you wish to override :obj:`self.eval_dataset`. If it is an :obj:`datasets.Dataset`,
+                columns not accepted by the ``model.forward()`` method are automatically removed.
+
+        Returns:
+            A dictionary containing the evaluation loss and the potential metrics computed from the predictions.
+        """
+        eval_dataloader = self.get_eval_dataloader(eval_dataset)
+
+        head_importance = self.head_importance_loop(eval_dataloader, description="Evaluation", model_type=model_type)
+
+        return head_importance
+
+    def head_importance_loop(
+        self, dataloader: DataLoader, description: str, prediction_loss_only: Optional[bool] = None, model_type: str = None,
+    ):
+
+        prediction_loss_only = (
+            prediction_loss_only if prediction_loss_only is not None else self.args.prediction_loss_only
+        )
+
+        model = self.model
+        # multi-gpu eval
+        if self.args.n_gpu > 1:
+            model = torch.nn.DataParallel(model)
+        else:
+            model = self.model
+        # Note: in torch.distributed mode, there's no point in wrapping the model
+        # inside a DistributedDataParallel as we'll be under `no_grad` anyways.
+
+        '''
+        batch_size = dataloader.batch_size
+        logger.info("***** Running %s *****", description)
+        logger.info("  Num examples = %d", self.num_examples(dataloader))
+        logger.info("  Batch size = %d", batch_size)
+        '''
+        preds: torch.Tensor = None
+        label_ids: torch.Tensor = None
+        model.eval()
+
+        if "distilbert" in model_type:
+            bert = model.module.distilbert if hasattr(model, "module") else model.distilbert
+        elif "roberta" in model_type:
+            bert = model.module.roberta if hasattr(model, "module") else model.roberta
+        elif "mobilebert" in model_type:
+            bert = model.module.mobilebert if hasattr(model, "module") else model.mobilebert
+        else:
+            bert = model.module.bert if hasattr(model, "module") else model.bert
+
+        if is_torch_tpu_available():
+            dataloader = pl.ParallelLoader(dataloader, [self.args.device]).per_device_loader(self.args.device)
+
+        if self.args.past_index >= 0:
+            self._past = None
+
+        disable_tqdm = not self.is_local_process_zero() or self.args.disable_tqdm
+
+        head_importance = torch.zeros(model.config.num_hidden_layers, model.config.num_attention_heads).to(model.device)
+        tot_tokens = 0
+
+        for inputs in tqdm(dataloader, desc=description, disable=disable_tqdm):
+            loss = self.head_importance_step(model, inputs, prediction_loss_only)
+            batch_size = inputs[list(inputs.keys())[0]].shape[0]
+
+            loss.backward()
+
+            for layer in range(model.config.num_hidden_layers):
+                self_att = bert.transformer.layer[layer].attention if "distilbert" in model_type else bert.encoder.layer[layer].attention.self
+                ctx = self_att.context_layer_val
+                grad_ctx = ctx.grad
+                # Take the dot
+                dot = torch.einsum("bhli,bhli->bhl", [grad_ctx, ctx])
+                head_importance[layer] += dot.abs().sum(-1).sum(0).detach()
+
+            tot_tokens += inputs["attention_mask"].float().detach().sum().data
+        head_importance /= tot_tokens
+
+        exponent = 2
+        norm_by_layer = torch.pow(torch.pow(head_importance, exponent).sum(-1), 1/exponent)
+        head_importance /= norm_by_layer.unsqueeze(-1) + 1e-20
+
+        return head_importance
+            
+    def head_importance_step(
+        self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], prediction_loss_only: bool
+    ):
+        """
+        Perform an evaluation step on :obj:`model` using obj:`inputs`.
+
+        Subclass and override to inject custom behavior.
+
+        Args:
+            model (:obj:`nn.Module`):
+                The model to evaluate.
+            inputs (:obj:`Dict[str, Union[torch.Tensor, Any]]`):
+                The inputs and targets of the model.
+
+                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
+                argument :obj:`labels`. Check your model's documentation for all accepted arguments.
+            prediction_loss_only (:obj:`bool`):
+                Whether or not to return the loss only.
+
+        Return:
+            Tuple[Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]:
+            A tuple with the loss, logits and labels (each being optional).
+        """
+        has_labels = all(inputs.get(k) is not None for k in self.args.label_names)
+        inputs = self._prepare_inputs(inputs)
+
+        output_attentions = getattr(inputs, 'output_attentions', None)
+        output_hidden_states = getattr(inputs, 'output_hidden_states', None)
+
+        # if self.args.n_gpu > 1:
+        #     config_output_attentions = self.model.module.config.output_attentions
+        #     config_output_hidden_states = self.model.module.config.output_hidden_states
+        # else:
+        #     config_output_attentions = self.model.config.output_attentions
+        #     config_output_hidden_states = self.model.config.output_hidden_states
+
+        output_attentions = output_attentions if output_attentions is not None else self.model.config.output_attentions
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.model.config.output_hidden_states
+        
+        outputs = model(**inputs)
+        if has_labels:
+            # The .mean() is to reduce in case of distributed training
+            loss = outputs[0]
+        
+        return loss
 
     def prediction_loop(
-        self, dataloader: DataLoader, description: str, prediction_loss_only: Optional[bool] = None
+        self, dataloader: DataLoader, description: str, prediction_loss_only: Optional[bool] = None, head_prune: Optional[bool] = None
     ) -> PredictionOutput:
         """
         Prediction/evaluation loop, shared by :obj:`Trainer.evaluate()` and :obj:`Trainer.predict()`.
@@ -663,7 +920,10 @@ class LengthDropTrainer(Trainer):
             self._past = None
 
         disable_tqdm = not self.is_local_process_zero() or self.args.disable_tqdm
+        start_time = timeit.default_timer()
         for inputs in tqdm(dataloader, desc=description, disable=disable_tqdm):
+            if head_prune is None:
+                inputs["head_prune"] = True
             loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only)
             batch_size = inputs[list(inputs.keys())[0]].shape[0]
             if loss is not None:
@@ -672,6 +932,7 @@ class LengthDropTrainer(Trainer):
                 preds = logits if preds is None else nested_concat(preds, logits, dim=0)
             if labels is not None:
                 label_ids = labels if label_ids is None else nested_concat(label_ids, labels, dim=0)
+        evalTime = timeit.default_timer() - start_time
 
         if self.args.past_index and hasattr(self, "_past"):
             # Clean the state at the end of the evaluation loop
@@ -717,7 +978,7 @@ class LengthDropTrainer(Trainer):
             if not key.startswith("eval_"):
                 metrics[f"eval_{key}"] = metrics.pop(key)
 
-        return PredictionOutput(predictions=preds, label_ids=label_ids, metrics=metrics)
+        return PredictionOutput(predictions=preds, label_ids=label_ids, metrics=metrics), evalTime
 
     def prediction_step(
         self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], prediction_loss_only: bool
@@ -759,18 +1020,18 @@ class LengthDropTrainer(Trainer):
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.model.config.output_hidden_states
         num_additional_outputs = int(output_attentions == True) + int(output_hidden_states == True)
 
-        with torch.no_grad():
-            outputs = model(**inputs)
-            if has_labels:
-                # The .mean() is to reduce in case of distributed training
-                loss = outputs[0].mean().item()
-                logits = outputs[1:(len(outputs) - num_additional_outputs)]
-            else:
-                loss = None
-                # Slicing so we get a tuple even if `outputs` is a `ModelOutput`.
-                logits = outputs[:(len(outputs) - num_additional_outputs)]
-            if self.args.past_index >= 0:
-                self._past = outputs[self.args.past_index if has_labels else self.args.past_index - 1]
+        
+        outputs = model(**inputs)
+        if has_labels:
+            # The .mean() is to reduce in case of distributed training
+            loss = outputs[0].mean().item()
+            logits = outputs[1:(len(outputs) - num_additional_outputs)]
+        else:
+            loss = None
+            # Slicing so we get a tuple even if `outputs` is a `ModelOutput`.
+            logits = outputs[:(len(outputs) - num_additional_outputs)]
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index if has_labels else self.args.past_index - 1]
 
         if prediction_loss_only:
             return (loss, None, None)
@@ -862,7 +1123,7 @@ class LengthDropTrainer(Trainer):
         area /= (self.upper_constraint - self.lower_constraint)
         return self.population, area
 
-    def add_gene(self, gene, macs=None, score=None, method=0, parents=None):
+    def add_gene(self, gene, method=0, parents=None, latency=False):
         if gene not in self.store:
             self.model.eval()
             if self.model.config.model_type == "distilbert":
@@ -870,36 +1131,60 @@ class LengthDropTrainer(Trainer):
             else:
                 assert hasattr(self.model, "bert")
                 bert = self.model.bert
-            bert.set_length_config(gene)
-            macs = macs or torchprofile.profile_macs(self.model, args=self.dummy_inputs)
-            # logger.info(gene, macs)
-            if macs < self.lower_constraint:
-                return False
-            score = score or self.evaluate()["eval_" + self.best_metric]
-            self.store[gene] = (macs, score, method, parents)
-            logger.info(store2str(gene, macs, score, method, parents))
+            bert.set_length_config(gene[0])
+            head_importance = self.get_head_importance(model_type=self.model.config.model_type)
 
-        macs = self.store[gene][0]
-        if macs >= self.lower_constraint \
-                and (self.upper_constraint is None or macs <= self.upper_constraint) \
+            to_prune = what_to_prune(
+                    head_importance,
+                    gene[1],
+                    to_prune={},
+                    at_least_x_heads_per_layer=1,    
+            )
+            bert.prune_heads(to_prune)
+            if not latency:
+                macs_or_latency = torchprofile.profile_macs(self.model, args=self.dummy_inputs)
+                # logger.info(gene, macs)
+                if macs_or_latency < self.lower_constraint:
+                    return False
+                metric, _ = self.evaluate(head_prune=False, evo_search=True)
+            else:
+                metric, macs_or_latency = self.evaluate(head_prune=False, evo_search=True)
+            bert.revert_pruned_heads(to_prune)
+            score = metric["eval_" + self.best_metric]
+            self.store[gene] = (macs_or_latency, score, method, parents)
+            logger.info(store2str(gene, macs_or_latency, score, method, parents))
+
+        macs_or_latency = self.store[gene][0]
+        if macs_or_latency >= self.lower_constraint \
+                and (self.upper_constraint is None or macs_or_latency <= self.upper_constraint) \
                 and gene not in self.population:
             self.population.append(gene)
             return True
         return False
 
-    def mutate(self, mutation_prob):
+    def mutate(self, mutation_prob, latency_constraint):
         gene = random.choice(self.population)
-        mutated_gene = ()
+        mutated_gene_length = ()
+        mutated_gene_head = ()
         for i in range(self.model.config.num_hidden_layers):
             if np.random.uniform() < mutation_prob:
-                prev = (self.args.max_seq_length if i == 0 else mutated_gene[i - 1])
-                next = (2 if i == self.model.config.num_hidden_layers - 1 else gene[i + 1])
-                mutated_gene += (random.randrange(next, prev + 1),)
+                prev = (self.args.max_seq_length if i == 0 else mutated_gene_length[i - 1])
+                next = (2 if i == self.model.config.num_hidden_layers - 1 else gene[0][i + 1])
+                mutated_gene_length += (random.randrange(next, prev + 1),)
+                
+                prev = (0 if i == 0 else mutated_gene_head[i - 1])
+                next = (self.model.config.num_attention_heads - 1 if i == self.model.config.num_hidden_layers - 1 else gene[1][i + 1])
+                mutated_gene_head += (random.randrange(prev, next + 1),)
             else:
-                mutated_gene += (gene[i],)
-        return self.add_gene(mutated_gene, method=1, parents=(gene,))
+                mutated_gene_length += (gene[0][i],)
+                mutated_gene_head += (gene[1][i],)
 
-    def crossover(self):
+        mutated_gene = (mutated_gene_length, mutated_gene_head)
+        return self.add_gene(mutated_gene, method=1, parents=(gene,), latency=latency_constraint)
+
+    def crossover(self, latency_constraint):
         gene0, gene1 = random.sample(self.population, 2)
-        crossovered_gene = tuple((g0 + g1 + 1) // 2 for g0, g1 in zip(gene0, gene1))
-        return self.add_gene(crossovered_gene, method=2, parents=(gene0, gene1))
+        crossovered_gene_length = tuple((g0 + g1 + 1) // 2 for g0, g1 in zip(gene0[0], gene1[0]))
+        crossovered_gene_head = tuple((g0 + g1 + 1) // 2 for g0, g1 in zip(gene0[1], gene1[1]))
+        crossovered_gene = (crossovered_gene_length, crossovered_gene_head)
+        return self.add_gene(crossovered_gene, method=2, parents=(gene0, gene1), latency=latency_constraint)

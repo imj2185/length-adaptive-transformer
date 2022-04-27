@@ -33,8 +33,12 @@ def inverse(x):
 
 
 def store2str(gene, macs, score, method, parents=None):
-    store_str = f"({', '.join(f'{x:3d}' for x in gene)}):"
-    store_str += f" {macs} MACs"
+    if any(isinstance(i, tuple) for i in gene):
+        store_str = f"({', '.join(f'{x:3d}' for x in gene[0])}),"
+        store_str += f"({', '.join(f'{x:1d}' for x in gene[1])}):"
+    else:
+        store_str = f"({', '.join(f'{x:3d}' for x in gene)}),"
+    store_str += f" {macs} MACs/latency"
     store_str += f" | score {score}"
     store_str += f" | method {method}"
     if parents is not None:
