@@ -212,7 +212,7 @@ class MobileBertSelfAttention(nn.Module):
         super().__init__()
 
         self.original_num_attention_heads = config.num_attention_heads
-        self.original_attention_head_size = int(config.hidden_size / config.num_attention_heads)
+        self.original_attention_head_size = int(config.true_hidden_size / config.num_attention_heads)
         self.original_all_head_size = self.original_num_attention_heads * self.original_attention_head_size
 
         self.num_attention_heads = config.num_attention_heads
@@ -251,9 +251,9 @@ class MobileBertSelfAttention(nn.Module):
         head_index=None,
     ):
         if head_prune:
-            mixed_query_layer = self.query_f(query_tensor)
-            mixed_key_layer = self.key_f(key_tensor)
-            mixed_value_layer = self.value_f(value_tensor)
+            mixed_query_layer = self.query_f(query_tensor, head_index)
+            mixed_key_layer = self.key_f(key_tensor, head_index)
+            mixed_value_layer = self.value_f(value_tensor, head_index)
         else:
             mixed_query_layer = self.query(query_tensor)
             mixed_key_layer = self.key(key_tensor)
@@ -395,7 +395,7 @@ class MobileBertAttention(nn.Module):
         )
         # Run a linear projection of `hidden_size` then add a residual
         # with `layer_input`.
-        attention_output = self.output(self_outputs[0], layer_input)
+        attention_output = self.output(self_outputs[0], layer_input, head_prune=head_prune, head_index=head_index if heads is not None else None,)
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
         if heads is not None:
             self.self.num_attention_heads = self.self.original_num_attention_heads
@@ -588,9 +588,9 @@ class MobileBertEncoder(nn.Module):
 
         last_hidden_state = restored_hidden_states if length_config is not None else hidden_states
         if not return_dict:
-            return tuple(v for v in [hidden_states, all_hidden_states, all_attentions] if v is not None)
+            return tuple(v for v in [last_hidden_state, all_hidden_states, all_attentions] if v is not None)
         return BaseModelOutput(
-            last_hidden_state=hidden_states, hidden_states=all_hidden_states, attentions=all_attentions
+            last_hidden_state=last_hidden_state, hidden_states=all_hidden_states, attentions=all_attentions
         )
 
 
