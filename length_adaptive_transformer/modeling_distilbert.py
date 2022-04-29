@@ -741,6 +741,7 @@ class DistilBertForQuestionAnswering(DistilBertPreTrainedModel):
         self,
         input_ids=None,
         attention_mask=None,
+        token_type_ids=None,
         head_mask=None,
         inputs_embeds=None,
         start_positions=None,
