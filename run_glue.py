@@ -356,18 +356,6 @@ def main():
 
     return eval_results
 
-    if search_args.do_ray_search:
-        import ray
-        @ray.remote
-        class EvoNetwork(object):
-            def __init__(self, 
-                tokenizer: PreTrainedTokenizer = None,
-                best_metric: str = 'acc',
-                length_drop_args: LengthDropArguments = None,
-                **kwargs,
-            ):
-                self.tokenizer = tokenizer
-
 
 
 def _mp_fn(index):
