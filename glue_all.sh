@@ -3,6 +3,7 @@
 MODEL=$1
 # EXP_TYPE=$2
 # BENCHMARK=$3
+# run_squad conda env prune in A100
 
 function standard_finetune () {
     echo $1 $2 $3 "${4,,}"
@@ -32,6 +33,7 @@ do
     tmux new-session -d -s "$session"
     tmux send-keys -t "$session" "setenv PATH /home/mdl/cvl5361/softwares/a100/bin:/home/mdl/cvl5361/softwares/a100/condabin:/usr/local/cuda-11.4/bin:/home/grads/cvl5361/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:." Enter
     tmux send-keys -t "$session" "bash" Enter
+    tmux send-keys -t "$session" "export PATH=/home/mdl/cvl5361/softwares/a100/bin:/home/mdl/cvl5361/softwares/a100/condabin:/usr/local/cuda-11.4/bin:/home/grads/cvl5361/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:." Enter
     tmux send-keys -t "$session" "conda activate lat" Enter
 
     standard_finetune $session $((cuda_id % 4)) $MODEL $bench
