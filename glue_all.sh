@@ -39,7 +39,6 @@ do
     #tmux send-keys -t "$session" "conda activate lat" Enter
     standard_finetune $session $((cuda_id % 4)) $MODEL $bench
     let "cuda_id+=1"
-
 done
 
 
