@@ -7,16 +7,16 @@ MODEL=$1
 
 function standard_finetune () {
     echo $1 $2 $3 "${4,,}"
-    tmux send-keys -t "$1" "git checkout master" Enter
+    #tmux send-keys -t "$1" "git checkout master" Enter
     if  [ $3 = "mobilebert" ]
     then
-        tmux send-keys -t "$1" "CUDA_VISIBLE_DEVICES=$2 python run_glue.py --model_name_or_path google/$3-uncased --task_name "${4,,}" --do_train --do_eval --data_dir glue/$4 --max_seq_length 128 --per_device_train_batch_size 32 --per_device_eval_batch_size 32 --learning_rate 2e-5 --num_train_epochs 3.0 --output_dir glue_output/$4/standard" Enter
+        tmux send-keys -t "$1" "CUDA_VISIBLE_DEVICES=$2 python run_glue.py --model_name_or_path google/$3-uncased --task_name "${4,,}" --do_train --do_eval --data_dir glue/$4 --max_seq_length 128 --per_device_train_batch_size 16 --per_device_eval_batch_size 16 --learning_rate 2e-5 --num_train_epochs 3.0 --output_dir glue_output/$4/standard" Enter
     elif [ $3 = "bert" ]
     then
-        tmux send-keys -t "$1" "CUDA_VISIBLE_DEVICES=$2 python run_glue.py --model_name_or_path $3-base-cased --task_name "${4,,}" --do_train --do_eval --data_dir glue/$4 --max_seq_length 128 --per_device_train_batch_size 32 --per_device_eval_batch_size 32 --learning_rate 2e-5 --num_train_epochs 3.0 --output_dir glue_output/$4/standard" Enter
+        tmux send-keys -t "$1" "CUDA_VISIBLE_DEVICES=$2 python run_glue.py --model_name_or_path $3-base-cased --task_name "${4,,}" --do_train --do_eval --data_dir glue/$4 --max_seq_length 128 --per_device_train_batch_size 16 --per_device_eval_batch_size 16 --learning_rate 2e-5 --num_train_epochs 3.0 --output_dir glue_output/$4/standard" Enter
     elif [ $3 = "distilbert" ]
     then
-        tmux send-keys -t "$1" "CUDA_VISIBLE_DEVICES=$2 python run_glue.py --model_name_or_path $3-base-cased --task_name "${4,,}" --do_train --do_eval --data_dir glue/$4 --max_seq_length 128 --per_device_train_batch_size 32 --per_device_eval_batch_size 32 --learning_rate 2e-5 --num_train_epochs 3.0 --output_dir glue_output/$4/standard" Enter
+        tmux send-keys -t "$1" "CUDA_VISIBLE_DEVICES=$2 python run_glue.py --model_name_or_path $3-base-cased --task_name "${4,,}" --do_train --do_eval --data_dir glue/$4 --max_seq_length 128 --per_device_train_batch_size 16 --per_device_eval_batch_size 16 --learning_rate 2e-5 --num_train_epochs 3.0 --output_dir glue_output/$4/standard" Enter
     fi
 }
 
