@@ -352,12 +352,15 @@ class MobileBertEncoder(nn.Module):
             if output_attentions:
                 all_attentions = all_attentions + (layer_outputs[1],)
 
-        last_hidden_state = restored_hidden_states if length_config is not None else hidden_states
+        last_hidden_states = restored_hidden_states if length_config is not None else hidden_states
+        
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (last_hidden_states,)
 
         if not return_dict:
-            return tuple(v for v in [last_hidden_state, all_hidden_states, all_attentions] if v is not None)
+            return tuple(v for v in [last_hidden_states, all_hidden_states, all_attentions] if v is not None)
         return BaseModelOutput(
-            last_hidden_state=last_hidden_state, hidden_states=all_hidden_states, attentions=all_attentions
+            last_hidden_state=last_hidden_states, hidden_states=all_hidden_states, attentions=all_attentions
         )
 
 
