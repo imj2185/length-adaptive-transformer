@@ -20,8 +20,23 @@ function standard_finetune () {
     fi
 }
 
+function lat_finetune () {
+    echo $1 $2 $3 "${4,,}"
+    #tmux send-keys -t "$1" "git checkout master" Enter
+    if  [ $3 = "mobilebert" ]
+    then
+        tmux send-keys -t "$1" "CUDA_VISIBLE_DEVICES=$2 python run_glue.py --model_name_or_path glue_output/$4/$3/standard/checkpoint-best --task_name "${4,,}" --do_train --do_eval --data_dir glue/$4 --max_seq_length 128 --per_device_train_batch_size 16 --per_device_eval_batch_size 16 --learning_rate 2e-5 --num_train_epochs 5.0 --output_dir glue_output/$4/$3/length_adaptive --length_adaptive --num_sandwich 2 --length_drop_ratio_bound 0.05 --layer_dropout_prob 0.15 --overwrite_output_dir" Enter
+    elif [ $3 = "bert" ]
+    then
+        tmux send-keys -t "$1" "CUDA_VISIBLE_DEVICES=$2 python run_glue.py --model_name_or_path glue_output/$4/$3/standard/checkpoint-best --task_name "${4,,}" --do_train --do_eval --data_dir glue/$4 --max_seq_length 128 --per_device_train_batch_size 16 --per_device_eval_batch_size 16 --learning_rate 2e-5 --num_train_epochs 5.0 --output_dir glue_output/$4/$3/length_adaptive --length_adaptive --num_sandwich 2 --length_drop_ratio_bound 0.2 --layer_dropout_prob 0.2 --overwrite_output_dir" Enter
+    elif [ $3 = "distilbert" ]
+    then
+        tmux send-keys -t "$1" "CUDA_VISIBLE_DEVICES=$2 python run_glue.py --model_name_or_path glue_output/$4/$3/standard/checkpoint-best --task_name "${4,,}" --do_train --do_eval --data_dir glue/$4 --max_seq_length 128 --per_device_train_batch_size 16 --per_device_eval_batch_size 16 --learning_rate 2e-5 --num_train_epochs 5.0 --output_dir glue_output/$4/$3/length_adaptive --length_adaptive --num_sandwich 2 --length_drop_ratio_bound 0.2 --layer_dropout_prob 0.2 --overwrite_output_dir" Enter
+    fi
+}
+
 cuda_id=0
-for bench in "CoLA" "MNLI" "QNLI" "QQP" "RTE" "SST-2" "STS-B" "WNLI" "MRPC"
+for bench in "CoLA" "MNLI" "QNLI" "QQP" "RTE" "SST-2" "STS-B" "MRPC"
 do
     mkdir glue_output/$bench
     mkdir glue_output/$bench/$MODEL
