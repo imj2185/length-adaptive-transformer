@@ -380,6 +380,45 @@ class LengthDropTrainer(Trainer):
         else:
             bert = model.module.bert if hasattr(model, "module") else model.bert
 
+        hi_path_list = model_path.split(os.sep)
+        head_importance_path = os.path.join(hi_path_list[0], hi_path_list[1], hi_path_list[2], "head_importance.pt")
+        head_importance = torch.zeros(model.config.num_hidden_layers, model.config.num_attention_heads).to(bert.device)
+        
+        for step, inputs in enumerate(train_dataloader):
+            model.train()
+            inputs = self._prepare_inputs(inputs)
+
+            inputs["output_attentions"] = None
+            inputs["layer_config"] = None
+            inputs["length_config"] = None
+            inputs["head_prune"] = True
+
+            outputs = model(**inputs)
+            task_loss = self.div_loss(outputs[0])
+            loss = task_loss
+            loss.backward()
+
+            for layer in range(model.config.num_hidden_layers):
+                self_att = bert.transformer.layer[layer].attention if "distilbert" in model_path else bert.encoder.layer[layer].attention.self
+                ctx = self_att.context_layer_val
+                grad_ctx = ctx.grad
+                # Take the dot
+                dot = torch.einsum("bhli,bhli->bhl", [grad_ctx, ctx])
+                head_importance[layer] += dot.abs().sum(-1).sum(0).detach()
+
+            tot_tokens = inputs["attention_mask"].float().detach().sum().data
+        head_importance /= tot_tokens
+
+        exponent = 2
+        norm_by_layer = torch.pow(torch.pow(head_importance, exponent).sum(-1), 1/exponent)
+        head_importance /= norm_by_layer.unsqueeze(-1) + 1e-20
+
+        print("head_importance_measured!")
+        print(head_importance)
+
+        torch.save(head_importance, head_importance_path)
+
+        model.zero_grad()
         for epoch in range(epochs_trained, int(np.ceil(num_train_epochs))):
             if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
                 train_dataloader.sampler.set_epoch(epoch)
@@ -440,19 +479,6 @@ class LengthDropTrainer(Trainer):
                 else:
                     loss.backward()
 
-                head_importance = torch.zeros(model.config.num_hidden_layers, model.config.num_attention_heads).to(model.device)
-
-                for layer in range(model.config.num_hidden_layers):
-                    if layer in layer_config:
-                        self_att = bert.transformer.layer[layer].attention if "distilbert" in model_path else bert.encoder.layer[layer].attention.self
-                        ctx = self_att.context_layer_val
-                        grad_ctx = ctx.grad
-                        # Take the dot
-                        dot = torch.einsum("bhli,bhli->bhl", [grad_ctx, ctx])
-                        head_importance[layer] += dot.abs().sum(-1).sum(0).detach()
-
-                tot_tokens = inputs["attention_mask"].float().detach().sum().data
-                head_importance /= tot_tokens
                 # inplace distillation
                 if self.length_drop_args.length_adaptive:
                     logits = outputs[1].detach()
