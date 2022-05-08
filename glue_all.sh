@@ -99,6 +99,8 @@ do
     tmux send-keys -t "$session" "bash" Enter
     tmux send-keys -t "$session" "export PATH=/home/mdl/cvl5361/softwares/a100/bin:/home/mdl/cvl5361/softwares/a100/condabin:/usr/local/cuda-11.4/bin:/home/grads/cvl5361/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:." Enter
     tmux send-keys -t "$session" "conda activate lat" Enter
+    
+    let "cuda_id+=1"
 
     if  [ $EXP = "standard_finetune" ]
     then
@@ -115,8 +117,10 @@ do
     elif [ $EXP = "that_evo_search" ]
     then
         that_evo_search $session $((cuda_id % 4)) $MODEL $bench
+    else
+        echo "no function found"
     fi
-    let "cuda_id+=1"
+
 done
 
 
