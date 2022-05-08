@@ -815,10 +815,10 @@ class MobileBertForSequenceClassification(MobileBertPreTrainedModel):
     )
 
     def set_fn_layer_parameters(self):
-        self.bert.set_fn_layer_parameters()
+        self.mobilebert.set_fn_layer_parameters()
 
     def set_nn_layer_parameters(self):
-        self.bert.set_nn_layer_parameters()
+        self.mobilebert.set_nn_layer_parameters()
 
     def forward(
         self,
