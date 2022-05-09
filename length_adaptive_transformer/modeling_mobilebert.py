@@ -400,6 +400,9 @@ class MobileBertModel(MobileBertPreTrainedModel):
         for layer, heads in heads_to_prune.items():
             self.encoder.layer[layer].attention.prune_heads(heads)
 
+    def set_length_config(self, length_config):
+        self.length_config = length_config
+
     @add_start_docstrings_to_callable(MOBILEBERT_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         tokenizer_class=_TOKENIZER_FOR_DOC,
