@@ -875,7 +875,9 @@ class LengthDropTrainer(Trainer):
             # logger.info(gene, macs)
             if macs < self.lower_constraint:
                 return False
-            score = score or self.evaluate()["eval_" + self.best_metric]
+
+            metric_name = "eval_" + self.best_metric if self.best_metric != 'pearson_and_spearman' else "eval_corr"
+            score = score or self.evaluate()[metric_name]
             self.store[gene] = (macs, score, method, parents)
             logger.info(store2str(gene, macs, score, method, parents))
 
