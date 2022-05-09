@@ -26,7 +26,7 @@ import logging
 import os
 
 from regex import I
-os.environ["CUDA_VISIBLE_DEVICES"]='1'
+#os.environ["CUDA_VISIBLE_DEVICES"]='1'
 import sys
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional

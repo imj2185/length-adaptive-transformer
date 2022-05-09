@@ -2,6 +2,7 @@
 
 MODEL=$1
 EXP=$2
+SEED=$3
 # EXP_TYPE=$2
 # BENCHMARK=$3
 # run_squad conda env prune in A100
@@ -81,7 +82,7 @@ function that_evo_search() {
     fi
 }
 
-cuda_id=0
+cuda_id=$SEED
 for bench in "CoLA" "MNLI" "QNLI" "QQP" "RTE" "SST-2" "STS-B" "MRPC"
 do
     mkdir glue_output/$bench

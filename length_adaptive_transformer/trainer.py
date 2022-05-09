@@ -366,7 +366,7 @@ class LengthDropTrainer(Trainer):
 
         tr_loss_sum = 0.0
         loss_sum = defaultdict(float)
-        best = {self.best_metric: None}
+        best = {self.best_metric: None} if self.best_metric != 'pearson_and_spearman' else {'corr': None}
         model.zero_grad()
         disable_tqdm = self.args.disable_tqdm or not self.is_local_process_zero()
         train_pbar = trange(epochs_trained, int(np.ceil(num_train_epochs)), desc="Epoch", disable=disable_tqdm)
@@ -631,11 +631,16 @@ class LengthDropTrainer(Trainer):
                             output_dirs = [os.path.join(self.args.output_dir, checkpoint_folder)]
                             
                         if self.args.evaluate_during_training:
-                            if best[self.best_metric] is None or results[self.best_metric] >= best[self.best_metric]:
-                                logger.info("Congratulations, best model so far!")
-                                model.set_nn_layer_parameters()
-                                output_dirs.append(os.path.join(self.args.output_dir, "checkpoint-best"))
-                                best = results
+                            if self.best_metric == "pearson_and_spearman":
+                                if best['corr'] is None or results['corr'] > best['corr']:
+                                    logger.info("Congratulations, best model so far!")
+                                    output_dirs.append(os.path.join(self.args.output_dir, "checkpoint-best"))
+                                    best = results
+                            else:
+                                if best[self.best_metric] is None or results[self.best_metric] > best[self.best_metric]:
+                                    logger.info("Congratulations, best model so far!")
+                                    output_dirs.append(os.path.join(self.args.output_dir, "checkpoint-best"))
+                                    best = results
 
                         for output_dir in output_dirs:
                             self.save_model(output_dir)
