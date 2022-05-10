@@ -1181,6 +1181,7 @@ class LengthDropTrainer(Trainer):
                 macs_or_latency = torchprofile.profile_macs(self.model, args=self.dummy_inputs)
                 # logger.info(gene, macs)
                 if macs_or_latency < self.lower_constraint:
+                    bert.revert_pruned_heads(to_prune)
                     return False
                 metric, _ = self.evaluate(head_prune=False, evo_search=True)
             else:
