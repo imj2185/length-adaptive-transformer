@@ -1159,6 +1159,8 @@ class LengthDropTrainer(Trainer):
             self.model.eval()
             if self.model.config.model_type == "distilbert":
                 bert = self.model.distilbert
+            elif self.model.config.model_type == "mobilebert":
+                bert = self.model.mobilebert
             else:
                 assert hasattr(self.model, "bert")
                 bert = self.model.bert
