@@ -57,13 +57,13 @@ function lat_evo_search() {
     #tmux send-keys -t "$1" "git checkout master" Enter
     if  [ $3 = "mobilebert" ]
     then
-        tmux send-keys -t "$1" "CUDA_VISIBLE_DEVICES=$2 python run_glue.py --model_name_or_path glue_output/$4/$3/length_adaptive/checkpoint-best --task_name "${4,,}" --do_search --data_dir glue/$4 --max_seq_length 128 --per_device_eval_batch_size 16 --output_dir glue_output/$4/$3/evolutionary_search_lat --evo_iter 30 --mutation_size 30 --crossover_size 30 --overwrite_output_dir" Enter
+        tmux send-keys -t "$1" "CUDA_VISIBLE_DEVICES=$2 python run_glue.py --model_name_or_path glue_output/$4/$3/length_adaptive/checkpoint-best --task_name "${4,,}" --do_search --do_eval --data_dir glue/$4 --max_seq_length 128 --per_device_eval_batch_size 16 --output_dir glue_output/$4/$3/evolutionary_search_lat --evo_iter 30 --mutation_size 30 --crossover_size 30 --overwrite_output_dir" Enter
     elif [ $3 = "bert" ]
     then
-        tmux send-keys -t "$1" "CUDA_VISIBLE_DEVICES=$2 python run_glue.py --model_name_or_path glue_output/$4/$3/length_adaptive/checkpoint-best --task_name "${4,,}" --do_search --data_dir glue/$4 --max_seq_length 128 --per_device_eval_batch_size 16 --output_dir glue_output/$4/$3/evolutionary_search_lat --evo_iter 30 --mutation_size 30 --crossover_size 30 --overwrite_output_dir" Enter
+        tmux send-keys -t "$1" "CUDA_VISIBLE_DEVICES=$2 python run_glue.py --model_name_or_path glue_output/$4/$3/length_adaptive/checkpoint-best --task_name "${4,,}" --do_search --do_eval --data_dir glue/$4 --max_seq_length 128 --per_device_eval_batch_size 16 --output_dir glue_output/$4/$3/evolutionary_search_lat --evo_iter 30 --mutation_size 30 --crossover_size 30 --overwrite_output_dir" Enter
     elif [ $3 = "distilbert" ]
     then
-        tmux send-keys -t "$1" "CUDA_VISIBLE_DEVICES=$2 python run_glue.py --model_name_or_path glue_output/$4/$3/length_adaptive/checkpoint-best --task_name "${4,,}" --do_search --data_dir glue/$4 --max_seq_length 128 --per_device_eval_batch_size 16 --output_dir glue_output/$4/$3/evolutionary_search_lat --evo_iter 30 --mutation_size 30 --crossover_size 30 --overwrite_output_dir" Enter
+        tmux send-keys -t "$1" "CUDA_VISIBLE_DEVICES=$2 python run_glue.py --model_name_or_path glue_output/$4/$3/length_adaptive/checkpoint-best --task_name "${4,,}" --do_search --do_eval --data_dir glue/$4 --max_seq_length 128 --per_device_eval_batch_size 16 --output_dir glue_output/$4/$3/evolutionary_search_lat --evo_iter 30 --mutation_size 30 --crossover_size 30 --overwrite_output_dir" Enter
     fi
 }
 
@@ -72,18 +72,19 @@ function that_evo_search() {
     #tmux send-keys -t "$1" "git checkout master" Enter
     if  [ $3 = "mobilebert" ]
     then
-        tmux send-keys -t "$1" "CUDA_VISIBLE_DEVICES=$2 python run_glue.py --model_name_or_path glue_output/$4/$3/joint_adaptive/checkpoint-best --task_name "${4,,}" --do_search --data_dir glue/$4 --max_seq_length 128 --per_device_eval_batch_size 16 --output_dir glue_output/$4/$3/evolutionary_search_joint --evo_iter 30 --mutation_size 30 --crossover_size 30 --overwrite_output_dir" Enter
+        tmux send-keys -t "$1" "CUDA_VISIBLE_DEVICES=$2 python run_glue.py --model_name_or_path glue_output/$4/$3/joint_adaptive/checkpoint-best --task_name "${4,,}" --do_search --do_eval --data_dir glue/$4 --max_seq_length 128 --per_device_eval_batch_size 16 --output_dir glue_output/$4/$3/evolutionary_search_joint --evo_iter 30 --mutation_size 30 --crossover_size 30 --overwrite_output_dir" Enter
     elif [ $3 = "bert" ]
     then
-        tmux send-keys -t "$1" "CUDA_VISIBLE_DEVICES=$2 python run_glue.py --model_name_or_path glue_output/$4/$3/joint_adaptive/checkpoint-best --task_name "${4,,}" --do_search --data_dir glue/$4 --max_seq_length 128 --per_device_eval_batch_size 16 --output_dir glue_output/$4/$3/evolutionary_search_joint --evo_iter 30 --mutation_size 30 --crossover_size 30 --overwrite_output_dir" Enter
+        tmux send-keys -t "$1" "CUDA_VISIBLE_DEVICES=$2 python run_glue.py --model_name_or_path glue_output/$4/$3/joint_adaptive/checkpoint-best --task_name "${4,,}" --do_search --do_eval --data_dir glue/$4 --max_seq_length 128 --per_device_eval_batch_size 16 --output_dir glue_output/$4/$3/evolutionary_search_joint --evo_iter 30 --mutation_size 30 --crossover_size 30 --overwrite_output_dir" Enter
     elif [ $3 = "distilbert" ]
     then
-        tmux send-keys -t "$1" "CUDA_VISIBLE_DEVICES=$2 python run_glue.py --model_name_or_path glue_output/$4/$3/joint_adaptive/checkpoint-best --task_name "${4,,}" --do_search --data_dir glue/$4 --max_seq_length 128 --per_device_eval_batch_size 16 --output_dir glue_output/$4/$3/evolutionary_search_joint --evo_iter 30 --mutation_size 30 --crossover_size 30 --overwrite_output_dir" Enter
+        tmux send-keys -t "$1" "CUDA_VISIBLE_DEVICES=$2 python run_glue.py --model_name_or_path glue_output/$4/$3/joint_adaptive/checkpoint-best --task_name "${4,,}" --do_search --do_eval --data_dir glue/$4 --max_seq_length 128 --per_device_eval_batch_size 16 --output_dir glue_output/$4/$3/evolutionary_search_joint --evo_iter 30 --mutation_size 30 --crossover_size 30 --overwrite_output_dir" Enter
     fi
 }
 
 cuda_id=$SEED
-for bench in "CoLA" "MNLI" "QNLI" "QQP" "RTE" "SST-2" "STS-B" "MRPC"
+#excluded: "QQP" "RTE" "MNLI"
+for bench in "CoLA" "QNLI" "SST-2" "STS-B" "MRPC"
 do
     mkdir glue_output/$bench
     mkdir glue_output/$bench/$MODEL
@@ -101,7 +102,7 @@ do
     tmux send-keys -t "$session" "export PATH=/home/mdl/cvl5361/softwares/a100/bin:/home/mdl/cvl5361/softwares/a100/condabin:/usr/local/cuda-11.4/bin:/home/grads/cvl5361/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:." Enter
     tmux send-keys -t "$session" "conda activate lat" Enter
     
-    let "cuda_id+=1"
+    #let "cuda_id+=1"
 
     if  [ $EXP = "standard_finetune" ]
     then
@@ -123,7 +124,6 @@ do
     fi
 
 done
-
 
 
 

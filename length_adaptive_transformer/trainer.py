@@ -1163,7 +1163,10 @@ class LengthDropTrainer(Trainer):
                 assert hasattr(self.model, "bert")
                 bert = self.model.bert
             bert.set_length_config(gene[0])
-            head_importance = self.get_head_importance(model_type=self.model.config.model_type)
+            hi_path_list = self.args.output_dir.split(os.sep)
+            head_importance_path = os.path.join(hi_path_list[0], hi_path_list[1], hi_path_list[2], "head_importance.pt")
+            #head_importance = self.get_head_importance(model_type=self.model.config.model_type)
+            head_importance = torch.load(head_importance_path)
 
             to_prune = what_to_prune(
                     head_importance,
@@ -1181,7 +1184,9 @@ class LengthDropTrainer(Trainer):
             else:
                 metric, macs_or_latency = self.evaluate(head_prune=False, evo_search=True)
             bert.revert_pruned_heads(to_prune)
-            score = metric["eval_" + self.best_metric]
+
+            metric_name = "eval_" + self.best_metric if self.best_metric != 'pearson_and_spearman' else "eval_corr"
+            score = metric[metric_name]
             self.store[gene] = (macs_or_latency, score, method, parents)
             logger.info(store2str(gene, macs_or_latency, score, method, parents))
 
