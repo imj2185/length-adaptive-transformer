@@ -247,6 +247,19 @@ class MultiHeadSelfAttention(nn.Module):
         self.dim = attention_head_size * self.n_heads
         self.pruned_heads = self.pruned_heads.union(heads)
 
+    def revert_heads(self, heads, other=None):
+        attention_head_size = self.dim // self.n_heads
+        # Prune linear layers
+        self.q_lin = revert_pruned_linear_layer(self.q_lin_f)
+        self.k_lin = revert_pruned_linear_layer(self.k_lin_f)
+        self.v_lin = revert_pruned_linear_layer(self.v_lin_f)
+        self.out_lin = revert_pruned_linear_layer(self.out_lin_f)
+
+        # Update hyper params and store pruned heads
+        self.n_heads = self.n_heads + len(heads)
+        self.dim = attention_head_size * self.n_heads
+        self.pruned_heads = set()
+
     def forward(self, query, key, value, mask, head_mask=None, output_attentions=False, head_prune=False, head_index=None):
         """
         Parameters
@@ -550,6 +563,20 @@ class DistilBertModel(DistilBertPreTrainedModel):
         for layer in range(len(self.transformer.layer)):
             att = self.transformer.layer[layer].attention
             att.set_nn_layer_parameters()
+
+    def prune_heads(self, to_mask):
+        for layer in range(len(self.transformer.layer)):
+            if layer in to_mask:
+                heads = to_mask[layer]
+                att = self.transformer.layer[layer].attention
+                att.prune_heads(heads)
+
+    def revert_pruned_heads(self, to_mask, other=None):
+        for layer in range(len(self.transformer.layer)):
+            if layer in to_mask:
+                heads = to_mask[layer]
+                att = self.transformer.layer[layer].attention
+                att.revert_heads(heads, other)
 
     def set_head_importance_parameters(self):
         self.transformer.head_importance = torch.tensor([[0.3240, 0.2014, 0.2765, 0.3280, 0.3863, 0.1581, 0.1790, 0.1569, 0.3282, 0.4521, 0.3320, 0.1310],[0.2349, 0.2688, 0.2251, 0.2320, 0.1632, 0.3764, 0.5694, 0.1990, 0.1632, 0.2351, 0.2122, 0.3301],[0.2338, 0.2372, 0.3248, 0.4260, 0.1656, 0.2699, 0.1958, 0.2649, 0.2820, 0.3126, 0.3897, 0.2533],[0.4295, 0.2508, 0.2263, 0.1589, 0.2339, 0.4926, 0.1191, 0.1180, 0.3259, 0.2956, 0.3573, 0.1712],[0.0880, 0.0429, 0.1927, 0.2209, 0.0428, 0.0297, 0.3825, 0.0383, 0.6678, 0.0920, 0.2021, 0.5086],[0.0743, 0.4888, 0.4030, 0.2603, 0.5059, 0.0655, 0.1710, 0.1601, 0.2533,0.3606, 0.0610, 0.1109]]).to(self.transformer.device)
