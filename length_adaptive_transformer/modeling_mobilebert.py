@@ -400,6 +400,13 @@ class MobileBertModel(MobileBertPreTrainedModel):
         for layer, heads in heads_to_prune.items():
             self.encoder.layer[layer].attention.prune_heads(heads)
 
+    def prune_heads(self, to_mask):
+        for layer in range(len(self.encoder.layer)):
+            if layer in to_mask:
+                heads = to_mask[layer]
+                att = self.encoder.layer[layer].attention
+                att.prune_heads(heads)
+
     def set_length_config(self, length_config):
         self.length_config = length_config
 

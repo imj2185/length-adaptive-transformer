@@ -24,6 +24,7 @@
 import dataclasses
 import logging
 import os
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
 import sys
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional
@@ -68,6 +69,58 @@ glue_tasks_metrics = {
     "wnli": "acc",
 }
 
+def what_to_prune(
+    head_importance,
+    gene,
+    to_prune=None,
+    at_least_x_heads_per_layer=0,
+    rescale_by_number=False,
+):
+    head_importance = head_importance.clone()
+    n_layers, n_heads = head_importance.size()
+    to_prune = to_prune or {}
+    if rescale_by_number:
+        for layer in to_prune:
+            #head_importance[layer] *= sqrt(n_layers / len(to_prune[layer]))
+            head_importance[layer] *= math.sqrt(len(to_prune[layer]) / n_layers)
+    # Sort heads by score
+    heads_and_score = [
+        ((layer, head), head_importance[layer, head])
+        for layer in range(n_layers)
+        for head in range(n_heads)
+    ]
+    heads_and_score = sorted(heads_and_score, key=lambda x: x[1])
+    sorted_heads = [head_and_score[0]
+                    for head_and_score in heads_and_score]
+    # Ensure we don't delete all heads in a layer
+    if at_least_x_heads_per_layer:
+        # Remove the top scoring head in each layer
+        to_protect = {l: 0 for l in range(n_layers)}
+        filtered_sorted_heads = []
+        for layer, head in reversed(sorted_heads):
+            if layer in to_protect:
+                if to_protect[layer] < at_least_x_heads_per_layer:
+                    to_protect[layer] += 1
+                    continue
+                else:
+                    to_protect.pop(layer)
+            filtered_sorted_heads.insert(0, (layer, head))
+        sorted_heads = filtered_sorted_heads
+    # layer/heads that were already pruned
+    # Prune the lowest scoring heads
+    sorted_heads = [
+        (layer, head)
+        for (layer, head) in sorted_heads
+        if layer not in to_prune or head not in to_prune[layer]
+    ]
+    # Update heads to prune
+    for layer, head in sorted_heads:
+        if layer not in to_prune:
+            to_prune[layer] = []
+        if len(to_prune[layer]) < gene[layer]:
+            to_prune[layer].append(head)
+    return to_prune
+    
 @dataclass
 class ModelArguments:
     """
@@ -224,7 +277,7 @@ def main():
 
     # Evaluation
     eval_results = {}
-    if training_args.do_eval and not search_args.do_search:
+    if training_args.do_eval and not search_args.do_search and not search_args.do_mem_track:
         logger.info("*** Evaluate ***")
 
         # Loop to handle MNLI double evaluation (matched, mis-matched)
@@ -278,6 +331,74 @@ def main():
                         else:
                             item = test_dataset.get_labels()[item]
                             writer.write("%d\t%s\n" % (index, item))
+
+    if search_args.do_mem_track:
+        import torch.autograd.profiler as profiler
+        from pytorch_memlab import MemReporter
+        import torch
+        size = (1, data_args.max_seq_length)
+
+        if 'distilbert' in model_args.model_name_or_path:
+            dummy_inputs = {
+                "input_ids": torch.ones(size, dtype=torch.long).to(training_args.device),
+                "attention_mask": torch.ones(size, dtype=torch.long).to(training_args.device),
+                "output_attentions": True,
+            }
+        else:
+            dummy_inputs = {
+                "input_ids": torch.ones(size, dtype=torch.long).to(training_args.device),
+                "attention_mask": torch.ones(size, dtype=torch.long).to(training_args.device),
+                "token_type_ids": torch.zeros(size, dtype=torch.long).to(training_args.device),
+                "output_attentions": True,
+            }
+
+        if model.config.model_type == "distilbert":
+            bert = model.distilbert
+        elif model.config.model_type == "roberta":
+            bert = model.roberta
+        elif model.config.model_type == "mobilebert":
+            bert = model.mobilebert
+        else:
+            bert = model.bert
+
+        gene = eval(search_args.test_gene)
+        print(gene)
+        if any(isinstance(i, tuple) for i in gene):
+            bert.set_length_config(gene[0])
+            hi_path_list = model_args.model_name_or_path.split(os.sep)
+            head_importance_path = os.path.join(hi_path_list[0], hi_path_list[1], hi_path_list[2], "head_importance.pt")
+            head_importance = torch.load(head_importance_path)
+            to_prune = what_to_prune(
+                    head_importance,
+                    gene[1],
+                    to_prune={},
+                    at_least_x_heads_per_layer=1,    
+            )
+
+            bert.prune_heads(to_prune)
+            reporter = MemReporter(model)
+            output = model(**dummy_inputs)
+            reporter.report()
+        else:
+            bert.set_length_config(gene)
+            reporter = MemReporter(model)
+            output = model(**dummy_inputs)
+            reporter.report()
+        # bert.set_length_config((383, 365, 316, 316, 301, 301, 284, 262, 258, 254, 252, 218, 212, 189, 183, 169, 161, 151, 84, 67, 60, 46, 39, 20))
+        # bert.set_head_importance_parameters()
+        
+        # to_prune = what_to_prune(
+        #         bert.encoder.head_importance,
+        #         (0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3),
+        #         to_prune={},
+        #         at_least_x_heads_per_layer=1,    
+        # )
+
+        # bert.prune_heads(to_prune)
+
+        # reporter = MemReporter(model)
+        # output = model(**dummy_inputs)
+        # reporter.report()
 
     # Search
     if search_args.do_search:
@@ -338,6 +459,7 @@ def main():
                     k += 1
 
     return eval_results
+    
 
 
 def _mp_fn(index):

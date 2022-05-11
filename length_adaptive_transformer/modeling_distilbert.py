@@ -244,6 +244,13 @@ class DistilBertModel(DistilBertPreTrainedModel):
         for layer, heads in heads_to_prune.items():
             self.transformer.layer[layer].attention.prune_heads(heads)
 
+    def prune_heads(self, to_mask):
+        for layer in range(len(self.transformer.layer)):
+            if layer in to_mask:
+                heads = to_mask[layer]
+                att = self.transformer.layer[layer].attention
+                att.prune_heads(heads)
+
     def set_length_config(self, length_config):
         self.length_config = length_config
 

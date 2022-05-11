@@ -94,17 +94,22 @@ def add_drop_and_restore_args(parser):
 @dataclass
 class SearchArguments:
     do_search: Optional[bool] = field(default=False)
+    do_mem_track: Optional[bool] = field(default=False)
     load_store_file: Optional[str] = field(default=None)
     evo_iter: Optional[int] = field(default=100)
     population_size: Optional[int] = field(default=20)
     mutation_size: Optional[int] = field(default=30)
     mutation_prob: Optional[float] = field(default=0.5)
     crossover_size: Optional[int] = field(default=30)
+    test_gene: Optional[str] = field(default=None)
+
 
 
 def add_search_args(parser):
     parser.add_argument("--do_search", action="store_true")
+    parser.add_argument("--do_mem_track", action="store_true")
     parser.add_argument("--load_store_file", default=None, type=str)
+    parser.add_argument("--test_gene", default=None, type=str)
     parser.add_argument("--evo_iter", default=100, type=int)
     parser.add_argument("--population_size", default=20, type=int)
     parser.add_argument("--mutation_size", default=30, type=int)

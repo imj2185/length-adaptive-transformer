@@ -268,6 +268,13 @@ class BertModel(BertPreTrainedModel):
     def set_length_config(self, length_config):
         self.length_config = length_config
 
+    def prune_heads(self, to_mask):
+        for layer in range(len(self.encoder.layer)):
+            if layer in to_mask:
+                heads = to_mask[layer]
+                att = self.encoder.layer[layer].attention
+                att.prune_heads(heads)
+
     @add_start_docstrings_to_callable(BERT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
         tokenizer_class=_TOKENIZER_FOR_DOC,
