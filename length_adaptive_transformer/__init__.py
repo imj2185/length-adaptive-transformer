@@ -8,6 +8,7 @@ from transformers import (
     BertConfig,
     DistilBertConfig,
     MobileBertConfig,
+    LongformerConfig,
 )
 
 from .modeling_bert import (
@@ -22,12 +23,17 @@ from .modeling_mobilebert import (
     MobileBertForSequenceClassification,
     MobileBertForQuestionAnswering,
 )
+from.modeling_longformer import (
+    LongformerForSequenceClassification,
+    LongformerForQuestionAnswering,
+)
 
 MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING.update(
     [
         (BertConfig, BertForSequenceClassification),
         (DistilBertConfig, DistilBertForSequenceClassification),
         (MobileBertConfig, MobileBertForSequenceClassification),
+        (LongformerConfig, LongformerForSequenceClassification),
     ]
 )
 
@@ -36,6 +42,7 @@ MODEL_FOR_QUESTION_ANSWERING_MAPPING.update(
         (BertConfig, BertForQuestionAnswering),
         (DistilBertConfig, DistilBertForQuestionAnswering),
         (MobileBertConfig, MobileBertForQuestionAnswering),
+        (LongformerConfig, LongformerForQuestionAnswering),
     ]
 )
 
